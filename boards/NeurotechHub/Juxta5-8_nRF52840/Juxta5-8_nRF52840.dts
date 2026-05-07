@@ -1,0 +1,135 @@
+/dts-v1/;
+#include <nordic/nrf52840_qiaa.dtsi>
+#include "Juxta5-8_nRF52840-pinctrl.dtsi"
+
+/ {
+	model = "Juxta5-8_nRF52840";
+	compatible = "NeurotechHub,Juxta5-8_nRF52840";
+
+	chosen {
+		zephyr,sram = &sram0;
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		led0: led_0 {
+			gpios = <&gpio0 9 GPIO_ACTIVE_HIGH>;
+			label = "LED0";
+		};
+	};
+
+	gpio_keys {
+		compatible = "gpio-keys";
+		magnet_sensor: magnet_sensor {
+			gpios = <&gpio0 25 GPIO_ACTIVE_LOW>;
+			label = "Magnet detect interrupt";
+		};
+		accel_int1: accel_int1 {
+			gpios = <&gpio1 11 GPIO_ACTIVE_LOW>;
+			label = "Accelerometer interrupt 1";
+		};
+	};
+
+	aliases {
+		led0 = &led0;
+		magnet-sensor = &magnet_sensor;
+		accel-int = &accel_int1;
+		spi-mem = &mem0;
+		spi-accel = &accel0;
+		fuel-adc = &adc;
+		rtc = &rtc0;
+	};
+
+	zephyr,user {
+		io-channels = <&adc 0>;
+	};
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&gpiote {
+	status = "okay";
+};
+
+&rtc0 {
+	status = "okay";
+};
+
+&wdt0 {
+	status = "okay";
+};
+
+&spi0 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+	pinctrl-0 = <&spi0_default>;
+	pinctrl-1 = <&spi0_sleep>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio1 13 GPIO_ACTIVE_LOW>, <&gpio1 6 GPIO_ACTIVE_LOW>;
+
+	mem0: memory@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		size = <DT_SIZE_M(4)>;
+	};
+
+	accel0: accel@1 {
+		compatible = "st,lis2dh12-spi";
+		reg = <1>;
+		spi-max-frequency = <8000000>;
+		label = "LIS2DH12";
+	};
+};
+
+&adc {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40)>;
+		zephyr,input-positive = <NRF_SAADC_AIN4>;
+		zephyr,resolution = <14>;
+		zephyr,oversampling = <8>;
+	};
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 DT_SIZE_K(48)>;
+		};
+
+		slot0_partition: partition@c000 {
+			label = "image-0";
+			reg = <0x0000c000 DT_SIZE_K(464)>;
+		};
+
+		slot1_partition: partition@80000 {
+			label = "image-1";
+			reg = <0x00080000 DT_SIZE_K(464)>;
+		};
+
+		storage_partition: partition@f0000 {
+			label = "storage";
+			reg = <0x000f0000 DT_SIZE_K(64)>;
+		};
+	};
+};

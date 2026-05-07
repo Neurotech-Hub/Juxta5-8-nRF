@@ -1,0 +1,51 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "nrf-connect",
+            "request": "launch",
+            "name": "Launch nRF Connect application",
+            "config": "juxta5-8-blink",
+            "flash": true,
+            "runToEntryPoint": "main"
+        },
+        {
+            "type": "nrf-connect",
+            "request": "launch",
+            "name": "Launch the active build configuration",
+            "config": "${activeConfig}",
+            "flash": true,
+            "runToEntryPoint": "main"
+        },
+        {
+            "type": "nrf-connect",
+            "request": "launch",
+            "name": "Launch active config (RTT logs)",
+            "config": "${activeConfig}",
+            "snr": "802004887",
+            "gdbServer": {
+                "args": {
+                    "if": "SWD",
+                    "speed": 4000,
+                    "device": "NRF52840_XXAA",
+                    "select": "usb=${snr}",
+                    "port": "${port}",
+                    "rtos": "${rtosPlugin}",
+                    "jlinkscriptfile": "${jlinkScript}",
+                    "additionalArgs": [
+                        "singlerun",
+                        "nogui",
+                        "halt",
+                        "noir",
+                        "silent"
+                    ]
+                }
+            },
+            "flash": true,
+            "runToEntryPoint": "main"
+        }
+    ]
+}

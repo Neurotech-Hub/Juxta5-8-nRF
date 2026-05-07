@@ -1,0 +1,7 @@
+default: juxta5-8-blink
+build_dir: /Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build
+domains:
+  - name: juxta5-8-blink
+    build_dir: /Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/juxta5-8-blink
+flash_order:
+  - juxta5-8-blink

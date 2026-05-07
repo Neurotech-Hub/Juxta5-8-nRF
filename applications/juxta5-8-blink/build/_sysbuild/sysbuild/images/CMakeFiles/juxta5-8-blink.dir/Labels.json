@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/CMakeFiles/juxta5-8-blink"
+		},
+		{
+			"file" : "/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/CMakeFiles/juxta5-8-blink.rule"
+		},
+		{
+			"file" : "/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/CMakeFiles/juxta5-8-blink-complete.rule"
+		},
+		{
+			"file" : "/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-build.rule"
+		},
+		{
+			"file" : "/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-configure.rule"
+		},
+		{
+			"file" : "/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-download.rule"
+		},
+		{
+			"file" : "/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-install.rule"
+		},
+		{
+			"file" : "/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-mkdir.rule"
+		},
+		{
+			"file" : "/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-patch.rule"
+		},
+		{
+			"file" : "/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"juxta5-8-blink"
+		],
+		"name" : "juxta5-8-blink"
+	}
+}

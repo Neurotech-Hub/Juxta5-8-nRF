@@ -1,0 +1,13 @@
+# Target labels
+ juxta5-8-blink
+# Source files and their labels
+/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/CMakeFiles/juxta5-8-blink
+/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/CMakeFiles/juxta5-8-blink.rule
+/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/CMakeFiles/juxta5-8-blink-complete.rule
+/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-build.rule
+/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-configure.rule
+/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-download.rule
+/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-install.rule
+/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-mkdir.rule
+/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-patch.rule
+/Users/gaidica/Documents/Software/Juxta5-8/applications/juxta5-8-blink/build/_sysbuild/sysbuild/images/juxta5-8-blink-prefix/src/juxta5-8-blink-stamp/juxta5-8-blink-update.rule

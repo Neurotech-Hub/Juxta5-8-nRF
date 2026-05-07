@@ -1,0 +1,19 @@
+sample:
+  name: Juxta5-8 LED Blink Bring-up
+  description: >
+    Hardware bring-up test for Juxta5-8. LED0 blinks at 200 ms unless MAG_INT is high,
+    in which case LED0 is held on continuously.
+
+common:
+  tags:
+    - juxta
+    - bringup
+    - gpio
+    - magnet
+    - led
+
+tests:
+  applications.juxta5-8-blink:
+    platform_allow:
+      - Juxta5-8_nRF52840
+    harness: console
