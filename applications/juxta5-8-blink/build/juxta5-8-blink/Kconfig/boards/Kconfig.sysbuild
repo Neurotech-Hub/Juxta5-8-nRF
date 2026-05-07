@@ -1,2 +1,0 @@
-# Load Sysbuild board Kconfig descriptions.
-osource "/Users/gaidica/Documents/Software/Juxta5-8/boards/NeurotechHub/Juxta5-8_nRF52840/Kconfig.sysbuild"

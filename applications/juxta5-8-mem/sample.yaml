@@ -1,0 +1,16 @@
+sample:
+  name: Juxta5-8 External SPI NOR Tester
+  description: >
+    Destructive erase/write/read verify at offset 0 on external jedec,spi-nor.
+
+common:
+  tags:
+    - juxta
+    - flash
+    - spi_nor
+
+tests:
+  applications.juxta5-8-mem:
+    platform_allow:
+      - Juxta5-8_nRF52840
+    harness: console

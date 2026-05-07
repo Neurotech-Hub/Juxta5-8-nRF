@@ -53,6 +53,27 @@
             "name": "Launch juxta5-8-blink",
             "config": "${workspaceFolder}/applications/juxta5-8-blink/build/juxta5-8-blink",
             "runToEntryPoint": "main"
+        },
+        {
+            "type": "nrf-connect",
+            "request": "launch",
+            "name": "Launch juxta5-8-axy",
+            "config": "${workspaceFolder}/applications/juxta5-8-axy/build/juxta5-8-axy",
+            "runToEntryPoint": "main"
+        },
+        {
+            "type": "nrf-connect",
+            "request": "launch",
+            "name": "Launch juxta5-8-mem",
+            "config": "${workspaceFolder}/applications/juxta5-8-mem/build/juxta5-8-mem",
+            "runToEntryPoint": "main"
+        },
+        {
+            "type": "nrf-connect",
+            "request": "launch",
+            "name": "Launch juxta5-8-ble-test",
+            "config": "${workspaceFolder}/applications/juxta5-8-ble-test/build/juxta5-8-ble-test",
+            "runToEntryPoint": "main"
         }
     ]
 }

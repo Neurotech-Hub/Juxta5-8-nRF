@@ -1,2 +1,5 @@
 # Keep legacy materials as read-only reference.
 Reference/
+
+# Zephyr / nRF Connect SDK build outputs (never commit)
+applications/**/build/

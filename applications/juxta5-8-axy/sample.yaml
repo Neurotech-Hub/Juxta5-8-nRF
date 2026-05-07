@@ -1,0 +1,19 @@
+sample:
+  name: Juxta5-8 Accelerometer Tester
+  description: >
+    LIS2DH12 SPI Mode 0 bring-up app for Juxta5-8 with RTT telemetry and
+    motion interrupt logging on INT1.
+
+common:
+  tags:
+    - juxta
+    - accelerometer
+    - lis2dh12
+    - spi
+    - gpio
+
+tests:
+  applications.juxta5-8-axy:
+    platform_allow:
+      - Juxta5-8_nRF52840
+    harness: console

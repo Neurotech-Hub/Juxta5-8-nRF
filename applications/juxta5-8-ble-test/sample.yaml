@@ -1,0 +1,16 @@
+sample:
+  name: Juxta5-8 BLE Peripheral LED Test
+  description: >
+    Connectable GATT service: write 0/1 to control LED0.
+
+common:
+  tags:
+    - juxta
+    - bluetooth
+    - peripheral
+
+tests:
+  applications.juxta5-8-ble-test:
+    platform_allow:
+      - Juxta5-8_nRF52840
+    harness: console
