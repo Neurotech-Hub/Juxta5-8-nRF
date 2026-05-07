@@ -1,5 +1,8 @@
 {
     "nrf-connect.applications": [
         "${workspaceFolder}/applications/juxta5-8-blink"
-    ]
+    ],
+    "nrf-connect.debugging.bindings": {
+        "${workspaceFolder}/applications/juxta5-8-blink/build/juxta5-8-blink": "Launch juxta5-8-blink"
+    }
 }

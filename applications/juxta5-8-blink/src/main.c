@@ -12,11 +12,6 @@ static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 static const struct gpio_dt_spec magnet = GPIO_DT_SPEC_GET(DT_ALIAS(magnet_sensor), gpios);
 static const struct device *const gpio1_dev = DEVICE_DT_GET(DT_NODELABEL(gpio1));
 
-static int led_set_raw(int value)
-{
-	return gpio_pin_set(led.port, led.pin, value ? 1 : 0);
-}
-
 static int magnet_read_fallback(void)
 {
 	uint32_t absolute_pin = magnet.pin;
@@ -58,7 +53,7 @@ int main(void)
 
 	LOG_INF("Juxta5-8 blink bring-up started");
 	LOG_INF("Behavior: 200 ms blink when MAG_INT low, solid ON when MAG_INT high");
-	LOG_INF("LED0 raw drive on P%d.%02d", (led.port == gpio1_dev) ? 1 : 0, led.pin);
+	LOG_INF("LED0 mapped to P%d.%02d", (led.port == gpio1_dev) ? 1 : 0, led.pin);
 
 	while (1)
 	{
@@ -80,13 +75,13 @@ int main(void)
 
 		if (magnet_state)
 		{
-			(void)led_set_raw(1);
+			(void)gpio_pin_set_dt(&led, 1);
 			k_sleep(K_MSEC(50));
 		}
 		else
 		{
 			led_blink_state = !led_blink_state;
-			(void)led_set_raw(led_blink_state ? 1 : 0);
+			(void)gpio_pin_set_dt(&led, led_blink_state ? 1 : 0);
 			k_sleep(K_MSEC(BLINK_PERIOD_MS));
 		}
 	}
