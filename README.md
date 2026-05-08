@@ -98,11 +98,13 @@ Bring-up and feature work are intentionally split into separate apps so each sub
   - [`Reference/nRF/samples/ble/peripheral`](Reference/nRF/samples/ble/peripheral)
 
 ### `applications/juxta5-8-prod` (Implemented)
-- **Purpose**: Production Hublink firmware. Combines BLE peripheral advertising/scanning, LIS2DH12 motion/temperature, battery monitoring, and append-only NOR CSV logging (JXS settings/events, JXV vitals, JXB BLE observations). Settings (subject, experiment, mode, intervals) persist in nRF52840 internal flash via Zephyr NVS. External NOR is reserved exclusively for self-describing CSV log files recoverable by flash scan.
-- **BLE**: Hublink service UUIDs preserved for iOS compatibility. Node characteristic reports `firmware_version` 5.8.x plus 5.8-specific fields (`product`, `log_schema`, `logging_version`, `experiment`). Gateway characteristic accepts the same command surface as legacy (`timestamp`, `sendFilenames`, `clearMemory`, `operatingMode`, `scanInterval`, `subjectId`, `uploadPath`, etc.). File listing and transfer serve daily `JXS*/JXV*/JXB*.csv` pseudo-files over the file-transfer characteristic.
+- **Purpose**: Production Hublink firmware. Combines BLE peripheral advertising/scanning, LIS2DH12 motion/temperature, battery monitoring, and append-only NOR CSV logging (JXS settings/events, JXV vitals, JXB BLE observations). Settings persist in nRF52840 internal flash (NVS). External NOR holds only self-describing CSV log files recoverable by flash scan.
+- **BLE**: Hublink service UUIDs preserved for iOS compatibility. Node reports `firmware_version` 5.8.x plus `product`, `log_schema`, `logging_version`, `experiment`. Gateway accepts `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `operatingMode`, `scanInterval`, `vitalsInterval`, `subjectId`, `uploadPath`, `experiment`. File listing uses legacy `name|size;EOF` wire format. MTU exchange and 4 s supervision timeout requested on connect.
+- **Boot / shelf**: Fresh power-on → System OFF. Magnet wake → measure hold duration. < 7 s → normal wake (connectable adv, datetime sync required). ≥ 7 s → DFU stub (≥ 3.2 V required). Production magnet hold (not connected) → 5× blink → 5 s debounce → shelf. Debugger detected via `CoreDebug->DHCSR` and shelf/wake/DFU simulated in-band.
+- **Battery**: FUEL on P0.30/AIN6. Calibrated factor 7.96× (was 7.82). Brownout at 2.9 V → shelf; DFU access gated at 3.2 V; `low_battery` event logged in JXS before poweroff.
 - **NOR layout**: `0x000000–0x00FFFF` JXS (64 KB), `0x010000–0x10FFFF` JXV (1 MB), `0x110000–0x3FFFFF` JXB (3 MB).
 - **Deprecated**: ADC burst / electric mode removed entirely.
-- **Dependencies**: BLE peripheral + observer, SPI NOR, internal flash settings (NVS), LIS2DH12 SPI, SAADC fuel ADC, watchdog, RTT.
+- **Dependencies**: BLE peripheral + observer + GATT client (MTU exchange), SPI NOR, NVS, LIS2DH12 SPI, SAADC P0.30/AIN6, watchdog, RTT.
 - **Reference links**:
   - [`Reference/nRF/applications/juxta-ble`](Reference/nRF/applications/juxta-ble)
   - [`docs/JUXTA_NOR_Flash_Logging_Spec_v3.md`](docs/JUXTA_NOR_Flash_Logging_Spec_v3.md)

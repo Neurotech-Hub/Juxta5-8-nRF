@@ -275,23 +275,27 @@ applications/juxta5-8-prod/
 | NVS settings | `subject_id`, `experiment`, `mode`, `scan_interval_s`, `vitals_interval_s`, `upload_path` |
 | NOR CSV logging | JXS events, JXV vitals, JXB BLE observations; append-only, `#EOF` on close |
 | Log-state cache | MCU NVS caches file offsets; scans NOR on cache miss |
-| BLE state machine | Non-conn advertising bursts, passive scan bursts, JXGA_ gateway detection |
-| Battery level in Node JSON | SAADC mV sampled on connect and each vitals tick; linear 3.0–4.2 V → 0–100 % |
+| BLE state machine | Non-conn advertising bursts (10 s interval), passive scan bursts (configurable), JXGA_ gateway detection |
+| Battery level in Node JSON | SAADC mV sampled on connect and each vitals tick; calibrated factor 7.96×; linear 3.0–4.2 V → 0–100 % |
+| Battery safeguards | Brownout < 2.9 V → shelf mode (boot + vitals timer, logs `low_battery`); DFU gate < 3.2 V → falls back to normal wake |
 | Hublink GATT service | Node, Gateway, Filename, File Transfer characteristics; UUIDs match iOS companion |
 | Node JSON | Legacy keys + `product`, `log_schema`, `logging_version`, `experiment` (5.8 fields) |
-| Gateway commands | `timestamp`, `sendFilenames`, `clearMemory`, `operatingMode`, `scanInterval`, `subjectId`, `uploadPath`, `experiment` |
+| Gateway commands | `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `operatingMode`, `scanInterval`, `vitalsInterval`, `subjectId`, `uploadPath`, `experiment` |
+| BLE connection optimisation | MTU exchange initiated on connect; supervision timeout 4 s; preferred interval 30–50 ms via `bt_conn_le_param_update` |
+| Production magnet-to-shelf | Magnet held in production (not connected) → 5× blink → 5 s debounce → shelf mode |
+| Debugger simulation loop | `CoreDebug->DHCSR` detects J-Link; simulates shelf/wake/DFU cycle in-band; `sys_reboot()` restarts loop |
 | Vitals logging | LIS2DH12 temperature, SAADC battery voltage, motion count → JXV |
 | BLE observation logging | `JX_XXXXXX` peer detection → JXB rows with observer/peer/rssi |
-| JXS provenance rows | `boot`, `time_set`, `settings_changed`, `user_connected`, `user_disconnected`, `memory_cleared` |
+| JXS provenance rows | `boot`, `time_set`, `settings_changed`, `user_connected`, `user_disconnected`, `memory_cleared`, `low_battery` |
+| File listing wire format | `name\|size;name\|size;EOF` — matches legacy juxta-ble iOS parser |
+| FUEL pin correction | FUEL on P0.30/AIN6 (was incorrectly mapped to P0.28/AIN4 = AXY_INT2) |
 
 ### Pending / Not Yet Implemented
 
 | Feature | Notes |
 |---|---|
 | **DFU mode** | `enter_dfu_mode()` is a halting stub. Requires MCUboot SMP BLE stack (`CONFIG_MCUMGR`, `CONFIG_IMG_MANAGER`, SMP Bluetooth transport). DFU advertising name and behavior to be defined. |
-| **Re-enter shelf mode** | No mechanism to return to System OFF after production mode. Needs a gateway command (e.g., `goToSleep`) or idle timeout. |
-| **Low-battery gate** | No write suppression at low battery. Needs a threshold check before NOR writes (pattern from legacy `should_allow_fram_write()`). |
-| **Advertising interval setting** | `advInterval` gateway key updates `scan_interval_s` as a placeholder. These should be separate fields. |
+| **Advertising interval setting** | `advInterval` gateway key is logged but not applied; advertising uses `ADV_INTERVAL_S = 10` build constant. |
 | **Daily file rotation** | New date-named files are created when `juxta_time_now()` crosses midnight. Requires the clock to be valid; files accumulate until `clearMemory`. |
 | **iOS companion decoder** | iOS app needs a branch path for `log_schema: jxta-nor-csv-v3` to parse JXS/JXV/JXB CSV files instead of legacy FRAMFS binary blobs. |
-| **Hardware validation** | Full boot/magnet/datetime/scan/vitals/transfer sequence not yet tested on hardware. |
+| **Hardware validation** | Full boot/magnet/datetime/scan/vitals/transfer sequence tested on hardware; extended field deployment pending. |
