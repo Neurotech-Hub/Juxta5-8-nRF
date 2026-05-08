@@ -66,6 +66,10 @@ static const struct gpio_dt_spec accel_int = GPIO_DT_SPEC_GET(ACCEL_INT_NODE, gp
 #define FUEL_DIV_DEN 100L
 static const struct adc_dt_spec fuel = ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
 
+/* Battery voltage safeguards (applied at boot and in vitals timer). */
+#define BATT_BROWNOUT_MV 2900U /* Below this: immediate shelf mode */
+#define BATT_DFU_MIN_MV  3200U /* Below this: DFU access denied   */
+
 /* ---------------------------------------------------------------------------
  * LED mode state machine
  *
@@ -402,6 +406,17 @@ static void vitals_work_handler(struct k_work *work)
 	motion_events = 0;
 
 	(void)juxta_log_append_vitals(&log_ctx, now, motion, g_batt_mv, temp_c);
+
+	/* Brownout safeguard: log the event then return to shelf mode.
+	 * This fires once per vitals tick so the device doesn't log-storm. */
+	if (g_batt_mv > 0 && g_batt_mv < BATT_BROWNOUT_MV) {
+		LOG_WRN("Battery critical (%ld mV < %u mV) — logging low_battery, entering shelf",
+			(long)g_batt_mv, BATT_BROWNOUT_MV);
+		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
+					     "low_battery", now);
+		k_sleep(K_MSEC(50)); /* allow NOR write to complete */
+		enter_shelf_mode();
+	}
 }
 
 static void vitals_timer_cb(struct k_timer *timer)
@@ -868,6 +883,23 @@ int main(void)
 	k_timer_init(&led_timer, led_timer_cb, NULL);
 
 	/* ----------------------------------------------------------------
+	 * Step 2b: Early battery sample — needed before DFU gate and
+	 * brownout check which both occur before the main ADC init step.
+	 * Skip in debugger mode so a drained bench supply doesn't block
+	 * development workflows.
+	 * -------------------------------------------------------------- */
+	bool debugger_early = (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0U;
+	if (!debugger_early && adc_is_ready_dt(&fuel)) {
+		(void)adc_channel_setup_dt(&fuel);
+		(void)sample_battery_mv();
+		if (g_batt_mv > 0U && g_batt_mv < BATT_BROWNOUT_MV) {
+			LOG_WRN("Battery critical at wake (%ld mV < %u mV) — shelf mode",
+				(long)g_batt_mv, BATT_BROWNOUT_MV);
+			enter_shelf_mode(); /* does not return */
+		}
+	}
+
+	/* ----------------------------------------------------------------
 	 * Step 3: Check reset reason to determine boot path.
 	 * -------------------------------------------------------------- */
 	uint32_t resetreas = NRF_POWER->RESETREAS;
@@ -911,7 +943,14 @@ int main(void)
 			(long long)hold_ms, DFU_HOLD_THRESHOLD_MS);
 
 		if (hold_ms >= (int64_t)DFU_HOLD_THRESHOLD_MS) {
-			enter_dfu_mode(); /* does not return */
+			if (g_batt_mv > 0U && g_batt_mv < BATT_DFU_MIN_MV) {
+				LOG_WRN("[DBG] Battery too low for DFU (%ld mV < %u mV) — normal wake",
+					(long)g_batt_mv, BATT_DFU_MIN_MV);
+				gpio_pin_set_dt(&led, 0);
+				need_datetime_sync = true;
+			} else {
+				enter_dfu_mode(); /* does not return */
+			}
 		} else {
 			gpio_pin_set_dt(&led, 0);
 			need_datetime_sync = true;
@@ -933,7 +972,14 @@ int main(void)
 			LOG_INF("Magnet hold: %lld ms", (long long)hold_ms);
 
 			if (hold_ms >= (int64_t)DFU_HOLD_THRESHOLD_MS) {
-				enter_dfu_mode(); /* does not return */
+				if (g_batt_mv > 0U && g_batt_mv < BATT_DFU_MIN_MV) {
+					LOG_WRN("Battery too low for DFU (%ld mV < %u mV) — normal wake",
+						(long)g_batt_mv, BATT_DFU_MIN_MV);
+					gpio_pin_set_dt(&led, 0);
+					need_datetime_sync = true;
+				} else {
+					enter_dfu_mode(); /* does not return */
+				}
 			} else {
 				gpio_pin_set_dt(&led, 0);
 				need_datetime_sync = true;
