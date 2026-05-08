@@ -14,8 +14,10 @@ LOG_MODULE_REGISTER(juxta5_8_blink, LOG_LEVEL_INF);
 
 #define BLINK_PERIOD_MS 200U
 
-/* README: VBATT = VFUEL * 7.82 (divider Rtop 1.5M, Rbottom 220k) */
-#define FUEL_DIV_NUM 782L
+/* VBATT = VFUEL * 7.96 (calibrated: nominal 7.82 under-reads ~2%).
+ * Divider Rtop 1.5 MΩ, Rbottom 220 kΩ; empirical factor from
+ * hardware measurements (4.2 V → 94%, 3.5 V → 36% with 7.82). */
+#define FUEL_DIV_NUM 796L
 #define FUEL_DIV_DEN 100L
 
 /* Rough 1S LiPo percent from corrected battery voltage (linear 3.0 V … 4.2 V). */

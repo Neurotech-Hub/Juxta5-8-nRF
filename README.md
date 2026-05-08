@@ -31,7 +31,7 @@ This repository is the active Juxta5-8 firmware workspace. The `Reference/` dire
   - `Rtop = 1.5 MOhm` to `VBATT`
   - `Rbottom = 220 kOhm` to `GND`
   - Divider ratio: `0.12790698`
-  - Conversion: `VBATT = VFUEL * 7.82`
+  - Nominal conversion: `VBATT = VFUEL * 7.82`; calibrated empirically to `7.96` (board under-reads ~2%)
   - Expected max VFUEL at 4.2V LiPo: about `0.537V`
 - **P0.28 / AIN4**: `~AXY_INT2` (accelerometer interrupt 2, input only — not currently wired in firmware)
 

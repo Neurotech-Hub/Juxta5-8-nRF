@@ -61,16 +61,17 @@ void juxta_ble_set_production_ready(void)
 	production_ready = true;
 }
 
-/* Li-Po voltage to percent: 4200 mV = 100 %, 3000 mV = 0 % (linear). */
+/* Li-Po voltage to percent: linear 3000–4200 mV range.
+ * Output is clamped to 0–100 so noise above full-charge voltage
+ * or calibration drift never wraps the uint8 or returns >100. */
 static uint8_t batt_mv_to_percent(int32_t mv)
 {
-	if (mv >= 4200) {
-		return 100U;
-	}
 	if (mv <= 3000) {
 		return 0U;
 	}
-	return (uint8_t)((mv - 3000) * 100 / 1200);
+	int32_t pct = (mv - 3000) * 100 / 1200;
+
+	return (pct >= 100) ? 100U : (uint8_t)pct;
 }
 
 int juxta_ble_get_device_id(char *device_id)

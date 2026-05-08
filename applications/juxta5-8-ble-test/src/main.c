@@ -36,8 +36,8 @@ LOG_MODULE_REGISTER(juxta5_8_ble_test, LOG_LEVEL_INF);
 #error "Board must define zephyr,user io-channels for FUEL (AIN6, P0.30)"
 #endif
 
-/* README: VBATT = VFUEL * 7.82 (divider Rtop 1.5M, Rbottom 220k). */
-#define FUEL_DIV_NUM 782L
+/* VBATT = VFUEL * 7.96 (calibrated; see juxta5-8-prod for derivation). */
+#define FUEL_DIV_NUM 796L
 #define FUEL_DIV_DEN 100L
 
 /* Custom 128-bit UUIDs (test-only). */

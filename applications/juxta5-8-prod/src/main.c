@@ -59,8 +59,10 @@ static const struct gpio_dt_spec led       = GPIO_DT_SPEC_GET(LED_NODE, gpios);
 static const struct gpio_dt_spec magnet    = GPIO_DT_SPEC_GET(MAG_NODE, gpios);
 static const struct gpio_dt_spec accel_int = GPIO_DT_SPEC_GET(ACCEL_INT_NODE, gpios);
 
-/* Battery ADC — VBATT = VADC * 7.82 (divider 1.5 MΩ / 220 kΩ) */
-#define FUEL_DIV_NUM 782L
+/* Battery ADC — VBATT = VADC * 7.96 (calibrated from hardware measurements).
+ * Nominal factor for 1.5 MΩ / 220 kΩ divider is 7.82, but that under-reads
+ * ~2% on this board (4.2 V → 94%, 3.5 V → 36%).  7.96 gives ≈100% / ≈41%. */
+#define FUEL_DIV_NUM 796L
 #define FUEL_DIV_DEN 100L
 static const struct adc_dt_spec fuel = ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
 
