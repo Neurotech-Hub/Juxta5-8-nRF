@@ -13,7 +13,8 @@ This repository is the active Juxta5-8 firmware workspace. The `Reference/` dire
 | SPI SCK | `P0.12` | Shared SPI bus |
 | ~RESET | `P0.18` | Reset pin |
 | MAG_INT | `P0.25` | **Electrical LOW when magnet present** (active-low; devicetree `GPIO_ACTIVE_LOW`) |
-| FUEL / AIN4 | `P0.28` | Battery divider output |
+| ~AXY_INT2 | `P0.28` / AIN4 | Accelerometer interrupt 2 (input) |
+| FUEL / AIN6 | `P0.30` | Battery divider output |
 | ~AXY_CS | `P1.06` | LIS2DH12 chip select |
 | SPI MOSI | `P1.09` | Shared SPI bus |
 | ~AXY_INT1 | `P1.11` | Accelerometer interrupt 1 |
@@ -26,12 +27,13 @@ This repository is the active Juxta5-8 firmware workspace. The `Reference/` dire
 - **Magnet input `MAG_INT` (`P0.25`)**: DTS uses **`GPIO_ACTIVE_LOW`** — a present magnet asserts **electrical LOW** on the pad. Zephyr **`gpio_pin_get_dt(magnet_sensor)`** is **non-zero** when the magnet is present.
 - **Accelerometer**: LIS2DH12TR over SPI (reuse existing LIS2DH12 approach from reference applications)
 - **External memory**: 32 Mbit SPI NOR flash (`C2939873.pdf` in `Reference/`)
-- **Fuel divider**:
+- **Fuel divider** (P0.30 / AIN6):
   - `Rtop = 1.5 MOhm` to `VBATT`
   - `Rbottom = 220 kOhm` to `GND`
   - Divider ratio: `0.12790698`
   - Conversion: `VBATT = VFUEL * 7.82`
   - Expected max VFUEL at 4.2V LiPo: about `0.537V`
+- **P0.28 / AIN4**: `~AXY_INT2` (accelerometer interrupt 2, input only — not currently wired in firmware)
 
 ## Software Constraints
 

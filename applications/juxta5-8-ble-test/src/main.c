@@ -33,7 +33,7 @@
 LOG_MODULE_REGISTER(juxta5_8_ble_test, LOG_LEVEL_INF);
 
 #if !DT_NODE_EXISTS(DT_PATH(zephyr_user)) || !DT_NODE_HAS_PROP(DT_PATH(zephyr_user), io_channels)
-#error "Board must define zephyr,user io-channels for FUEL (AIN4)"
+#error "Board must define zephyr,user io-channels for FUEL (AIN6, P0.30)"
 #endif
 
 /* README: VBATT = VFUEL * 7.82 (divider Rtop 1.5M, Rbottom 220k). */
