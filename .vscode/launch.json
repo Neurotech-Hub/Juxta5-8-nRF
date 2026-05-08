@@ -74,6 +74,13 @@
             "name": "Launch juxta5-8-ble-test",
             "config": "${workspaceFolder}/applications/juxta5-8-ble-test/build/juxta5-8-ble-test",
             "runToEntryPoint": "main"
+        },
+        {
+            "type": "nrf-connect",
+            "request": "launch",
+            "name": "Launch juxta5-8-prod",
+            "config": "${workspaceFolder}/applications/juxta5-8-prod/build/juxta5-8-prod",
+            "runToEntryPoint": "main"
         }
     ]
 }

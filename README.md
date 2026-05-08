@@ -95,11 +95,15 @@ Bring-up and feature work are intentionally split into separate apps so each sub
   - [`Reference/nRF/applications/juxta-ble`](Reference/nRF/applications/juxta-ble)
   - [`Reference/nRF/samples/ble/peripheral`](Reference/nRF/samples/ble/peripheral)
 
-### `applications/juxta5-8-juxta-ble` (Planned integration)
-- **Purpose**: Start Juxta BLE port after all hardware bring-up apps are validated.
-- **Dependencies**: BLE + accelerometer + memory + fuel path integration.
+### `applications/juxta5-8-prod` (Implemented)
+- **Purpose**: Production Hublink firmware. Combines BLE peripheral advertising/scanning, LIS2DH12 motion/temperature, battery monitoring, and append-only NOR CSV logging (JXS settings/events, JXV vitals, JXB BLE observations). Settings (subject, experiment, mode, intervals) persist in nRF52840 internal flash via Zephyr NVS. External NOR is reserved exclusively for self-describing CSV log files recoverable by flash scan.
+- **BLE**: Hublink service UUIDs preserved for iOS compatibility. Node characteristic reports `firmware_version` 5.8.x plus 5.8-specific fields (`product`, `log_schema`, `logging_version`, `experiment`). Gateway characteristic accepts the same command surface as legacy (`timestamp`, `sendFilenames`, `clearMemory`, `operatingMode`, `scanInterval`, `subjectId`, `uploadPath`, etc.). File listing and transfer serve daily `JXS*/JXV*/JXB*.csv` pseudo-files over the file-transfer characteristic.
+- **NOR layout**: `0x000000–0x00FFFF` JXS (64 KB), `0x010000–0x10FFFF` JXV (1 MB), `0x110000–0x3FFFFF` JXB (3 MB).
+- **Deprecated**: ADC burst / electric mode removed entirely.
+- **Dependencies**: BLE peripheral + observer, SPI NOR, internal flash settings (NVS), LIS2DH12 SPI, SAADC fuel ADC, watchdog, RTT.
 - **Reference links**:
   - [`Reference/nRF/applications/juxta-ble`](Reference/nRF/applications/juxta-ble)
+  - [`docs/JUXTA_NOR_Flash_Logging_Spec_v3.md`](docs/JUXTA_NOR_Flash_Logging_Spec_v3.md)
 
 ## Validation Plan
 
@@ -141,9 +145,22 @@ Execution status:
 - Checklist defined: yes
 - Checklist executed on hardware: **done** (LED, battery read, advertise/reconnect, deep-sleep / magnet-wake validated)
 
+### `juxta5-8-prod` validation checklist
+
+1. Build and flash `applications/juxta5-8-prod` for `Juxta5-8_nRF52840`.
+2. RTT should log device ID (`JX_XXXXXX`), NVS settings load, NOR log init, and a `boot` row appended to `JXS`.
+3. Connect with nRF Connect or the iOS companion app. Node characteristic should return JSON with `"firmware_version":"5.8.0"`, `"product":"Juxta5-8"`, `"log_schema":"jxta-nor-csv-v3"`.
+4. Write gateway JSON `{"timestamp":1746000000}`. RTT logs timestamp accepted; `JXS` gets a `time_set` row.
+5. Write gateway JSON `{"sendFilenames":true}`. Filename characteristic indication lists `JXS*.csv;JXV*.csv;JXB*.csv` with sizes.
+6. Write a listed filename to the filename characteristic. File-transfer indication stream delivers CSV bytes ending with `#EOF`.
+7. Allow device to run one `vitals_interval_s`. RTT logs vitals; `JXV` byte count grows.
+8. With another `JX_XXXXXX` device nearby, let a scan cycle complete. RTT logs peers; `JXB` rows are appended.
+9. Write `{"clearMemory":true}`. NOR regions erase and fresh CSV files are created with a `memory_cleared` event. Internal settings survive (reconnect, read Node; `subject_id` and `experiment` unchanged).
+10. Power cycle; RTT shows NVS settings reloaded and NOR log cache recovered without re-scanning flash.
+
 ### Later app validation placeholders
 
 - `juxta5-8-axy`: implemented, runtime checklist pending hardware session
 - `juxta5-8-mem`: implemented; destructive-from-offset-0 checklist pending hardware session
 - `juxta5-8-ble-test`: implemented; BLE bring-up checklist executed on hardware
-- `juxta5-8-juxta-ble`: pending details
+- `juxta5-8-prod`: implemented; hardware + iOS validation pending board session

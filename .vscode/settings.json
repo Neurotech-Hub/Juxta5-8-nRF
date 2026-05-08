@@ -3,7 +3,8 @@
         "${workspaceFolder}/applications/juxta5-8-blink",
         "${workspaceFolder}/applications/juxta5-8-axy",
         "${workspaceFolder}/applications/juxta5-8-mem",
-        "${workspaceFolder}/applications/juxta5-8-ble-test"
+        "${workspaceFolder}/applications/juxta5-8-ble-test",
+        "${workspaceFolder}/applications/juxta5-8-prod"
     ],
     "nrf-connect.debugging.bindings": {
         "${workspaceFolder}/applications/juxta5-8-blink/build/juxta5-8-blink": "Launch juxta5-8-blink",
