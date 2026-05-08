@@ -564,6 +564,8 @@ static int start_nonconn_adv(void)
 
 	if (rc != 0) {
 		LOG_ERR("Non-conn adv start failed: %d", rc);
+	} else {
+		LOG_INF("Advertising as %s", adv_name);
 	}
 	return rc;
 }
@@ -709,9 +711,15 @@ static uint32_t last_scan_ts;
 static struct k_work state_work;
 static struct k_timer state_timer;
 
+/* Advertising interval is fixed: we broadcast our identity once every
+ * ADV_INTERVAL_S seconds so nearby Juxta devices can detect us.
+ * It is intentionally shorter than the scan interval so we advertise
+ * multiple times between each passive scan burst. */
+#define ADV_INTERVAL_S 10U
+
 static uint32_t get_adv_interval_s(void)
 {
-	return juxta_settings_get()->scan_interval_s;
+	return ADV_INTERVAL_S;
 }
 
 static uint32_t get_scan_interval_s(void)
@@ -819,6 +827,16 @@ void juxta_ble_datetime_synchronized(void)
 {
 	datetime_synchronized = true;
 	LOG_INF("Datetime synchronized");
+}
+
+void juxta_ble_reset_requested(void)
+{
+	/* Called from the BT RX thread via the gateway "reset" command.
+	 * Stop radio, give BLE stack a moment to send the disconnect, then
+	 * enter shelf mode.  enter_shelf_mode() does not return. */
+	LOG_INF("Gateway reset: entering shelf mode");
+	k_sleep(K_MSEC(200)); /* allow BLE disconnect PDU to be sent */
+	enter_shelf_mode();
 }
 
 /* ---------------------------------------------------------------------------

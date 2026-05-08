@@ -485,14 +485,11 @@ int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *s
 	}
 
 	if (need_format) {
-		/* juxta_log_format erases, creates files, and appends "memory_cleared". */
+		/* Erase all regions; file creation is deferred until time is valid
+		 * and production init writes the first data (same as the normal path). */
 		ctx->initialized = true;
-		rc = juxta_log_format(ctx, settings, device_id, now);
-		if (rc != 0) {
-			return rc;
-		}
-		/* Append "boot" after the format event so both appear in JXS. */
-		return juxta_log_append_event(ctx, settings, device_id, "boot", now);
+		rc = juxta_log_format(ctx);
+		return rc;
 	}
 
 	ctx->initialized = true;
@@ -539,10 +536,13 @@ static int erase_region(struct juxta_log_context *ctx, const struct log_region *
 	return 0;
 }
 
-int juxta_log_format(struct juxta_log_context *ctx, const struct juxta_settings *settings,
-		     const char *device_id, uint32_t unix_time)
+int juxta_log_format(struct juxta_log_context *ctx)
 {
-	if (!ctx || !ctx->flash || !settings) {
+	/* Erase all NOR CSV regions and reset in-memory state only.
+	 * File creation and provenance event logging are deferred to the caller
+	 * so that clearMemory during the sync phase does not bypass the
+	 * ProductionInit file-creation gate. */
+	if (!ctx || !ctx->flash) {
 		return -EINVAL;
 	}
 
@@ -561,14 +561,8 @@ int juxta_log_format(struct juxta_log_context *ctx, const struct juxta_settings 
 	ctx->active_jxv = UINT32_MAX;
 	ctx->active_jxb = UINT32_MAX;
 
-	int rc = ensure_file(ctx, JUXTA_LOG_JXS, settings, unix_time);
-	rc |= ensure_file(ctx, JUXTA_LOG_JXV, settings, unix_time);
-	rc |= ensure_file(ctx, JUXTA_LOG_JXB, settings, unix_time);
-	if (rc != 0) {
-		return rc;
-	}
-
-	return juxta_log_append_event(ctx, settings, device_id, "memory_cleared", unix_time);
+	LOG_INF("NOR CSV regions erased — file creation deferred to next data write");
+	return 0;
 }
 
 int juxta_log_append_event(struct juxta_log_context *ctx, const struct juxta_settings *settings,
@@ -657,18 +651,30 @@ int juxta_log_list_files(struct juxta_log_context *ctx, char *buffer, size_t buf
 		return -EINVAL;
 	}
 
+	/* Format: "name|size;name|size;EOF"
+	 * Each entry carries a trailing semicolon; "EOF" is appended with no
+	 * leading semicolon.  This matches the legacy juxta-ble wire format
+	 * that the iOS companion app uses as a termination sentinel. */
 	buffer[0] = '\0';
 	for (uint16_t i = 0; i < ctx->file_count; i++) {
 		const struct juxta_file_entry *entry = &ctx->files[i];
-		int len = snprintf(buffer + written, buffer_size - written, "%s%s|%u",
-				   (written > 0U) ? ";" : "", entry->path,
-				   entry->length + (entry->active ? (uint32_t)strlen(EOF_MARKER) : 0U));
+		uint32_t visible_len = entry->length +
+				       (entry->active ? (uint32_t)strlen(EOF_MARKER) : 0U);
+		int len = snprintf(buffer + written, buffer_size - written, "%s|%u;",
+				   entry->path, visible_len);
 
 		if (len < 0 || (size_t)len >= buffer_size - written) {
 			return -ENOSPC;
 		}
 		written += (size_t)len;
 	}
+
+	/* Append terminal "EOF" token. */
+	if (written + 3U >= buffer_size) {
+		return -ENOSPC;
+	}
+	memcpy(buffer + written, "EOF", 4U); /* includes null terminator */
+	written += 3U;
 
 	return (int)written;
 }

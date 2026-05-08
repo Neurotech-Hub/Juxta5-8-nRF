@@ -44,5 +44,6 @@ void juxta_ble_set_production_ready(void);
 
 void juxta_ble_timing_update_trigger(void);
 void juxta_ble_datetime_synchronized(void);
+void juxta_ble_reset_requested(void);
 
 #endif /* JUXTA_BLE_SERVICE_H_ */

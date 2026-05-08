@@ -335,21 +335,40 @@ static int apply_gateway_command(const char *json)
 		(void)send_file_listing(current_conn);
 	}
 
-	if (extract_bool_true(json, "clearMemory") && production_ready) {
-		(void)juxta_log_format(log_ctx, &next, device_id, juxta_time_now());
+	if (extract_bool_true(json, "clearMemory")) {
+		/* Always honored — explicit destructive action, not gated by production_ready.
+		 * Erase only; file creation is deferred to the next data write (ProductionInit
+		 * "boot" event or first vitals/scan row), consistent with the init path. */
+		LOG_INF("clearMemory: erasing all NOR CSV regions");
+		(void)juxta_log_format(log_ctx);
+	}
+
+	if (extract_bool_true(json, "reset")) {
+		/* Disconnect BLE and enter shelf mode (System OFF in production,
+		 * soft reboot in debug).  Implemented in main.c. */
+		LOG_INF("reset: entering shelf mode on request");
+		juxta_ble_reset_requested(); /* does not return */
 	}
 
 	if (extract_u32(json, "operatingMode", &value) == 0) {
-		(void)snprintf(next.mode, sizeof(next.mode), "%s", value == 0U ? "normal" : "normal");
+		/* ADC/electric mode is removed; all values map to normal. */
+		(void)snprintf(next.mode, sizeof(next.mode), "normal");
+		LOG_INF("operatingMode %u → normal (ADC mode not supported)", value);
 		changed = true;
 	}
 	if (extract_u32(json, "scanInterval", &value) == 0 && value > 0U && value <= UINT16_MAX) {
 		next.scan_interval_s = (uint16_t)value;
 		changed = true;
 	}
-	if (extract_u32(json, "advInterval", &value) == 0 && value > 0U && value <= UINT16_MAX) {
-		next.scan_interval_s = (uint16_t)value;
-		changed = true;
+	if (extract_u32(json, "advInterval", &value) == 0) {
+		/* Advertising interval is a build constant (ADV_INTERVAL_S in main.c).
+		 * Log the requested value but do not apply it to settings. */
+		LOG_INF("advInterval %u received (build constant used; not applied)", value);
+	}
+	if (extract_bool_true(json, "inactivityDoubler") ||
+	    strstr(json, "\"inactivityDoubler\":false") != NULL) {
+		/* Not implemented on this platform; acknowledge receipt only. */
+		LOG_INF("inactivityDoubler received (not implemented)");
 	}
 	if (extract_u32(json, "vitalsInterval", &value) == 0 && value > 0U && value <= UINT16_MAX) {
 		next.vitals_interval_s = (uint16_t)value;
@@ -511,12 +530,57 @@ int juxta_ble_service_init(struct juxta_log_context *ctx)
 	return 0;
 }
 
+static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
+			    struct bt_gatt_exchange_params *params)
+{
+	ARG_UNUSED(params);
+
+	if (err != 0U) {
+		LOG_WRN("MTU exchange failed: %u", err);
+	} else {
+		current_mtu = bt_gatt_get_mtu(conn);
+		LOG_INF("MTU exchanged: %u bytes (chunk size: %u)",
+			current_mtu, (uint16_t)(current_mtu > 3U ? current_mtu - 3U : 20U));
+	}
+}
+
+static struct bt_gatt_exchange_params mtu_exchange_params = {
+	.func = mtu_exchange_cb,
+};
+
+/* Preferred connection parameters:
+ *   interval 30-50 ms  — good balance of latency and power
+ *   slave latency 0    — peripheral responds every event (needed for indications)
+ *   supervision 4000ms — generous timeout; prevents spurious 0x08 disconnects
+ *                        during long NOR flash erase operations (~3.5 s observed) */
+/* BT_LE_CONN_PARAM expands to a compound literal and cannot be used as a
+ * static initializer — initialize the struct fields directly instead. */
+static const struct bt_le_conn_param hublink_conn_params = {
+	.interval_min = 24U,  /* 24 * 1.25 ms = 30 ms */
+	.interval_max = 40U,  /* 40 * 1.25 ms = 50 ms */
+	.latency      = 0U,   /* no slave latency */
+	.timeout      = 400U, /* 400 * 10 ms = 4000 ms supervision timeout */
+};
+
 void juxta_ble_connection_established(struct bt_conn *conn)
 {
 	current_conn = bt_conn_ref(conn);
 	current_mtu = bt_gatt_get_mtu(conn);
 	connected = true;
 	LOG_INF("Hublink connected mtu=%u", current_mtu);
+
+	/* Initiate MTU exchange — with CONFIG_BT_L2CAP_TX_MTU=247 we can push
+	 * up to 244-byte indication payloads, drastically reducing packet count
+	 * during file transfers and lowering supervision-timeout exposure. */
+	(void)bt_gatt_exchange_mtu(conn, &mtu_exchange_params);
+
+	/* Request longer supervision timeout and moderate connection interval.
+	 * The central (iOS) may accept or ignore this; we log the result via
+	 * the standard on_disconnected reason code. */
+	int err = bt_conn_le_param_update(conn, &hublink_conn_params);
+	if (err != 0) {
+		LOG_WRN("Connection param update request failed: %d", err);
+	}
 }
 
 void juxta_ble_connection_terminated(void)

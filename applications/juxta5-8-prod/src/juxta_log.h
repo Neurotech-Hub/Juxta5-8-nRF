@@ -34,8 +34,7 @@ struct juxta_log_context {
 
 int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *settings,
 		   const char *device_id);
-int juxta_log_format(struct juxta_log_context *ctx, const struct juxta_settings *settings,
-		     const char *device_id, uint32_t unix_time);
+int juxta_log_format(struct juxta_log_context *ctx);
 int juxta_log_append_event(struct juxta_log_context *ctx, const struct juxta_settings *settings,
 			   const char *device_id, const char *event, uint32_t unix_time);
 int juxta_log_append_vitals(struct juxta_log_context *ctx, uint32_t unix_time, uint8_t motion,

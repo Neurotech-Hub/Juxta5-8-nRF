@@ -187,6 +187,7 @@ JSON object; any subset of keys may be sent. Unrecognized keys are silently igno
 | `timestamp` | uint32 Unix seconds | Sets device clock; appends `time_set` row to JXS |
 | `sendFilenames` | bool | Triggers file listing indication on Filename characteristic |
 | `clearMemory` | bool | Erases all NOR CSV regions; creates fresh daily files; appends `memory_cleared` to JXS; **does not clear NVS settings** |
+| `reset` | bool | Immediately enters shelf mode (System OFF in production; soft reboot in debug) |
 | `operatingMode` | integer | Stored in NVS `mode`; no behavioral effect on this hardware (ADC mode removed) |
 | `scanInterval` | integer (seconds) | BLE scan interval; stored in NVS; appends `settings_changed` to JXS |
 | `vitalsInterval` | integer (seconds) | Vitals logging interval; stored in NVS; appends `settings_changed` to JXS |
