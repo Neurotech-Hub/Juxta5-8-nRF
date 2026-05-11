@@ -1,0 +1,16 @@
+sample:
+  name: Juxta5-8 BLE range test
+  description: >
+    Minimal advertiser (non-connectable JX_XXXXXX) or scanner (LED from scan); no GATT,
+    battery, or magnet/sleep.
+
+common:
+  tags:
+    - juxta
+    - bluetooth
+
+tests:
+  applications.juxta5-8-ble-range:
+    platform_allow:
+      - Juxta5-8_nRF52840
+    harness: console

@@ -1,0 +1,41 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+#
+# If this file exists, CMake sets KCONFIG_ROOT to it (see zephyr/cmake/modules/kconfig.cmake),
+# which replaces the default ${ZEPHYR_BASE}/Kconfig. We must therefore include the full Zephyr
+# Kconfig tree first — same as zephyr/Kconfig — then add our application menu.
+
+mainmenu "Zephyr Kernel Configuration"
+
+source "${ZEPHYR_BASE}/Kconfig.zephyr"
+
+menu "Juxta5-8 BLE range test"
+
+choice JUXTA_BLE_RANGE_ROLE
+	prompt "Device role"
+	default JUXTA_BLE_RANGE_ROLE_ADVERTISER
+	help
+	  Advertiser: non-connectable legacy advertising, local name JX_XXXXXX (public identity).
+	  Scanner: passive scan bursts every ~1 s; LED on if the configured peer name
+	  (or any other JX_XXXXXX) is seen. No GATT, battery, or magnet/sleep.
+
+config JUXTA_BLE_RANGE_ROLE_ADVERTISER
+	bool "Advertiser"
+	select BT_PERIPHERAL
+
+config JUXTA_BLE_RANGE_ROLE_SCANNER
+	bool "Scanner"
+	select BT_OBSERVER
+
+endchoice
+
+config JUXTA_RANGE_PEER_NAME
+	string "Scanner: exact peer name to match (e.g. JX_A1B2C3)"
+	depends on JUXTA_BLE_RANGE_ROLE_SCANNER
+	default ""
+	help
+	  If non-empty, the LED turns on only when this complete local name appears in an
+	  advertisement. If empty, any name of the form JX_ plus six hex digits counts,
+	  except this device's own name.
+
+endmenu
