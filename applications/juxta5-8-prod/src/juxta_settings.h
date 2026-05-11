@@ -10,7 +10,8 @@
 struct juxta_settings {
 	char subject_id[JUXTA_SUBJECT_ID_LEN];
 	char experiment[JUXTA_EXPERIMENT_LEN];
-	char mode[JUXTA_MODE_LEN];
+	/* NVS padding: former `mode` when operatingMode existed; keep size for settings blob compat. */
+	uint8_t settings_reserved[JUXTA_MODE_LEN];
 	char upload_path[JUXTA_UPLOAD_PATH_LEN];
 	uint16_t scan_interval_s;
 	uint16_t vitals_interval_s;

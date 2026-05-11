@@ -267,11 +267,13 @@ This file is critical for downstream analysis.
 unix,event,device_id,subject_id,experiment,fw_version,mode,scan_interval_s,vitals_interval_s,ble_name
 ```
 
+The **`mode`** column name is retained for schema compatibility. **Juxta5-8** firmware does not store or vary operating mode; every JXS row uses the literal **`normal`**.
+
 ## Example Rows
 
 ```csv
 1715200000,boot,JX_9B10A1,mouse_07,social_v1,1.2.3,normal,30,60,JX_9B10A1
-1715220000,settings_changed,JX_9B10A1,mouse_07,social_v1,1.2.3,dense_scan,10,60,JX_9B10A1
+1715220000,settings_changed,JX_9B10A1,mouse_07,social_v1,1.2.3,normal,10,60,JX_9B10A1
 1715260000,subject_changed,JX_9B10A1,mouse_08,social_v1,1.2.3,normal,30,60,JX_9B10A1
 ```
 

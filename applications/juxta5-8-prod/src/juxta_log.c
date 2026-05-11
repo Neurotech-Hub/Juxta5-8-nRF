@@ -36,7 +36,7 @@ struct log_region {
 
 static const struct log_region regions[] = {
 	{JUXTA_LOG_JXS, "JXS",
-	 "unix,event,device_id,subject_id,experiment,fw_version,mode,scan_interval_s,vitals_interval_s,ble_name\n",
+	 "unix,event,device_id,subject_id,experiment,fw_version,scan_interval_s,vitals_interval_s,ble_name\n",
 	 JXS_START, JXS_SIZE},
 	{JUXTA_LOG_JXV, "JXV", "unix,motion,batt_v,temp_c\n", JXV_START, JXV_SIZE},
 	{JUXTA_LOG_JXB, "JXB", "unix,observer_id,peer_id,rssi\n", JXB_START, JXB_SIZE},
@@ -433,12 +433,14 @@ static int append_row(struct juxta_log_context *ctx, enum juxta_log_type type, c
 	}
 
 	entry->length += strlen(row);
-	/* Do NOT save the NVS log cache here — doing so on every row append
-	 * puts a 520-byte struct + NVS write path (~400 bytes) on the BT RX
-	 * thread stack, causing a stack overflow.  The cache is saved in
-	 * ensure_file() when files are created/rotated, which is infrequent.
-	 * A stale cached offset is harmless: recovery scans NOR to find the
-	 * true write position. */
+	/* Do NOT save the NVS log cache here.  The NVS sectors are 4 KB each
+	 * and the cache struct is ~520 bytes, so a sector fills after ~7 writes.
+	 * At one JXB row every 20 s that means an erase cycle every ~2.5 min —
+	 * the nRF52840 internal flash (10 k cycles) would fail in ~17 days.
+	 * Instead the cache is saved only in ensure_file() on file
+	 * creation/rotation (~once per calendar day per type).  juxta_log_init()
+	 * reconciles stale cached lengths by scanning each active file with
+	 * find_eof_or_erased() on every boot. */
 	return 0;
 }
 
@@ -470,6 +472,41 @@ int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *s
 	if (rc == 0) {
 		context_from_cache(ctx, &cache);
 		LOG_INF("Loaded %u cached NOR CSV pseudo-files", ctx->file_count);
+
+		/* The NVS cache stores the file length only at file
+		 * creation/rotation — never on individual row appends.  After a
+		 * reboot on the same calendar day the cached length points back
+		 * to the header, and append_row would write at that stale offset
+		 * (into already-written NOR bytes that are silently ignored).
+		 * Scan each active file with find_eof_or_erased so entry->length
+		 * reflects every row that was written in previous sessions. */
+		for (uint16_t i = 0; i < ctx->file_count; i++) {
+			struct juxta_file_entry *e = &ctx->files[i];
+
+			if (!e->active) {
+				continue;
+			}
+			const struct log_region *rgn = region_for_type(e->type);
+
+			if (!rgn) {
+				continue;
+			}
+			uint32_t actual_end;
+			bool closed;
+			int scan_rc = find_eof_or_erased(ctx, e->offset,
+							 rgn->start + rgn->size,
+							 &actual_end, &closed);
+
+			if (scan_rc == 0) {
+				uint32_t actual_len = actual_end - e->offset;
+
+				if (actual_len != e->length) {
+					LOG_INF("Reconciled %s length %u → %u bytes",
+						e->path, e->length, actual_len);
+					e->length = actual_len;
+				}
+			}
+		}
 	} else {
 		rc = juxta_log_recover_files(ctx);
 		if (rc != 0) {
@@ -579,9 +616,9 @@ int juxta_log_append_event(struct juxta_log_context *ctx, const struct juxta_set
 		return rc;
 	}
 
-	int len = snprintf(row, sizeof(row), "%u,%s,%s,%s,%s,%s,%s,%u,%u,%s\n", unix_time,
+	int len = snprintf(row, sizeof(row), "%u,%s,%s,%s,%s,%s,%u,%u,%s\n", unix_time,
 			   event, device_id, settings->subject_id, settings->experiment,
-			   JUXTA_FIRMWARE_VERSION, settings->mode, settings->scan_interval_s,
+			   JUXTA_FIRMWARE_VERSION, settings->scan_interval_s,
 			   settings->vitals_interval_s, device_id);
 	if (len < 0 || len >= (int)sizeof(row)) {
 		return -ENOSPC;
@@ -643,6 +680,22 @@ int juxta_log_append_ble_observation(struct juxta_log_context *ctx, uint32_t uni
 	return append_row(ctx, JUXTA_LOG_JXB, row);
 }
 
+/* Bytes streamed over BLE (after filename line; closed files omit trailing #EOF). */
+uint32_t juxta_log_transfer_payload_bytes(const struct juxta_file_entry *entry)
+{
+	uint32_t skip = (uint32_t)strlen(entry->path) + 1U;
+
+	if (entry->length <= skip) {
+		return 0U;
+	}
+	uint32_t payload = entry->length - skip;
+
+	if (!entry->active && payload >= (uint32_t)strlen(EOF_MARKER)) {
+		payload -= (uint32_t)strlen(EOF_MARKER);
+	}
+	return payload;
+}
+
 int juxta_log_list_files(struct juxta_log_context *ctx, char *buffer, size_t buffer_size)
 {
 	size_t written = 0;
@@ -658,8 +711,7 @@ int juxta_log_list_files(struct juxta_log_context *ctx, char *buffer, size_t buf
 	buffer[0] = '\0';
 	for (uint16_t i = 0; i < ctx->file_count; i++) {
 		const struct juxta_file_entry *entry = &ctx->files[i];
-		uint32_t visible_len = entry->length +
-				       (entry->active ? (uint32_t)strlen(EOF_MARKER) : 0U);
+		uint32_t visible_len = juxta_log_transfer_payload_bytes(entry);
 		int len = snprintf(buffer + written, buffer_size - written, "%s|%u;",
 				   entry->path, visible_len);
 
@@ -730,6 +782,37 @@ int juxta_log_read_file(struct juxta_log_context *ctx, const struct juxta_file_e
 		memcpy(buffer, EOF_MARKER + eof_offset, to_read);
 	}
 
+	*bytes_read = to_read;
+	return 0;
+}
+
+int juxta_log_read_file_for_transfer(struct juxta_log_context *ctx,
+				     const struct juxta_file_entry *entry, uint32_t file_offset,
+				     uint8_t *buffer, size_t buffer_size, size_t *bytes_read)
+{
+	uint32_t payload;
+	uint32_t flash_abs;
+
+	if (!ctx || !entry || !buffer || !bytes_read) {
+		return -EINVAL;
+	}
+
+	payload = juxta_log_transfer_payload_bytes(entry);
+	if (file_offset >= payload) {
+		*bytes_read = 0;
+		return 0;
+	}
+
+	size_t to_read = MIN(buffer_size, (size_t)(payload - file_offset));
+	uint32_t skip = (uint32_t)strlen(entry->path) + 1U;
+
+	flash_abs = entry->offset + skip + file_offset;
+
+	int rc = flash_read(ctx->flash, flash_abs, buffer, to_read);
+
+	if (rc != 0) {
+		return rc;
+	}
 	*bytes_read = to_read;
 	return 0;
 }

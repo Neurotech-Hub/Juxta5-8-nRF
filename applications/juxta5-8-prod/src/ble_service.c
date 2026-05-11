@@ -35,6 +35,7 @@ static int32_t (*battery_mv_getter)(void);
 static uint16_t current_mtu = 23;
 static bool connected;
 static bool transfer_active;
+static bool transfer_eof_pending; /* awaiting ack for standalone "EOF" indication */
 static bool indication_pending;
 static char node_response[NODE_RESPONSE_MAX_SIZE];
 static char gateway_command[GATEWAY_COMMAND_MAX_SIZE];
@@ -156,7 +157,6 @@ static int generate_node_response(char *buffer, size_t buffer_size)
 	char device_id[JUXTA_DEVICE_ID_LEN];
 	const struct juxta_settings *settings = juxta_settings_get();
 	uint8_t battery_level = 0U;
-	uint8_t operating_mode = (strcmp(settings->mode, "normal") == 0) ? 0U : 2U;
 
 	(void)juxta_ble_get_device_id(device_id);
 
@@ -167,12 +167,13 @@ static int generate_node_response(char *buffer, size_t buffer_size)
 	int written = snprintf(buffer, buffer_size,
 			       "{\"upload_path\":\"%s\",\"firmware_version\":\"%s\","
 			       "\"battery_level\":%u,\"device_id\":\"%s\","
-			       "\"operating_mode\":%u,\"alert\":\"\","
+			       "\"alert\":\"\","
 			       "\"product\":\"%s\",\"log_schema\":\"%s\","
-			       "\"logging_version\":%u,\"experiment\":\"%s\"}",
-			       settings->upload_path, JUXTA_FIRMWARE_VERSION, battery_level,
-			       device_id, operating_mode, JUXTA_PRODUCT_NAME, JUXTA_LOG_SCHEMA,
-			       JUXTA_LOGGING_VERSION, settings->experiment);
+			       "\"logging_version\":%u,\"experiment\":\"%s\","
+			       "\"subject_id\":\"%s\"}",
+			       JUXTA_UPLOAD_PATH_FIXED, JUXTA_FIRMWARE_VERSION, battery_level,
+			       device_id, JUXTA_PRODUCT_NAME, JUXTA_LOG_SCHEMA,
+			       JUXTA_LOGGING_VERSION, settings->experiment, settings->subject_id);
 
 	if (written < 0 || written >= (int)buffer_size) {
 		return -ENOSPC;
@@ -241,7 +242,15 @@ static void file_transfer_indication_confirmed(struct bt_conn *conn,
 	indication_pending = false;
 	if (err != 0U) {
 		LOG_WRN("file transfer indication failed: 0x%02x", err);
+		transfer_eof_pending = false;
 		transfer_active = false;
+		return;
+	}
+
+	if (transfer_eof_pending) {
+		transfer_eof_pending = false;
+		transfer_active = false;
+		LOG_INF("transfer complete");
 		return;
 	}
 
@@ -276,8 +285,10 @@ static int start_transfer(const char *name)
 	}
 
 	transfer_offset = 0;
+	transfer_eof_pending = false;
 	transfer_active = true;
-	LOG_INF("transfer start %s len=%u", transfer_entry.path, transfer_entry.length);
+	LOG_INF("transfer start %s payload=%u", transfer_entry.path,
+		juxta_log_transfer_payload_bytes(&transfer_entry));
 	return 0;
 }
 
@@ -291,17 +302,35 @@ static void continue_file_transfer(void)
 		return;
 	}
 
-	rc = juxta_log_read_file(log_ctx, &transfer_entry, transfer_offset, transfer_chunk, max_chunk,
-				 &bytes_read);
+	rc = juxta_log_read_file_for_transfer(log_ctx, &transfer_entry, transfer_offset,
+					      transfer_chunk, max_chunk, &bytes_read);
 	if (rc != 0) {
 		LOG_ERR("transfer read failed: %d", rc);
+		transfer_eof_pending = false;
 		transfer_active = false;
 		return;
 	}
 
 	if (bytes_read == 0U) {
-		transfer_active = false;
-		LOG_INF("transfer complete");
+		uint32_t payload_len = juxta_log_transfer_payload_bytes(&transfer_entry);
+
+		if (transfer_offset != payload_len) {
+			LOG_ERR("transfer: stale offset=%u payload_len=%u", transfer_offset,
+				payload_len);
+			transfer_eof_pending = false;
+			transfer_active = false;
+			return;
+		}
+
+		memcpy(transfer_chunk, "EOF", 3);
+		transfer_eof_pending = true;
+		rc = send_indication(current_conn, file_transfer_char_attr, transfer_chunk, 3,
+				     file_transfer_indication_confirmed);
+		if (rc != 0) {
+			LOG_WRN("EOF indication busy/failed: %d", rc);
+			transfer_eof_pending = false;
+			transfer_active = false;
+		}
 		return;
 	}
 
@@ -310,6 +339,8 @@ static void continue_file_transfer(void)
 			     file_transfer_indication_confirmed);
 	if (rc != 0) {
 		LOG_WRN("transfer indication busy/failed: %d", rc);
+		transfer_eof_pending = false;
+		transfer_active = false;
 	}
 }
 
@@ -351,12 +382,6 @@ static int apply_gateway_command(const char *json)
 		juxta_ble_reset_requested(); /* does not return */
 	}
 
-	if (extract_u32(json, "operatingMode", &value) == 0) {
-		/* ADC/electric mode is removed; all values map to normal. */
-		(void)snprintf(next.mode, sizeof(next.mode), "normal");
-		LOG_INF("operatingMode %u → normal (ADC mode not supported)", value);
-		changed = true;
-	}
 	if (extract_u32(json, "scanInterval", &value) == 0 && value > 0U && value <= UINT16_MAX) {
 		next.scan_interval_s = (uint16_t)value;
 		changed = true;
@@ -376,9 +401,6 @@ static int apply_gateway_command(const char *json)
 		changed = true;
 	}
 	if (extract_string(json, "subjectId", next.subject_id, sizeof(next.subject_id)) == 0) {
-		changed = true;
-	}
-	if (extract_string(json, "uploadPath", next.upload_path, sizeof(next.upload_path)) == 0) {
 		changed = true;
 	}
 	if (extract_string(json, "experiment", next.experiment, sizeof(next.experiment)) == 0) {
@@ -476,7 +498,8 @@ static ssize_t read_file_transfer_char(struct bt_conn *conn, const struct bt_gat
 	}
 
 	size_t bytes_read = 0;
-	int rc = juxta_log_read_file(log_ctx, &transfer_entry, offset, buf, len, &bytes_read);
+	int rc = juxta_log_read_file_for_transfer(log_ctx, &transfer_entry, offset, buf, len,
+						  &bytes_read);
 	if (rc != 0) {
 		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
 	}
@@ -591,6 +614,7 @@ void juxta_ble_connection_terminated(void)
 		current_conn = NULL;
 	}
 	connected = false;
+	transfer_eof_pending = false;
 	transfer_active = false;
 	indication_pending = false;
 }

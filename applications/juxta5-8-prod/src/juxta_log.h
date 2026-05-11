@@ -47,6 +47,11 @@ int juxta_log_find_file(struct juxta_log_context *ctx, const char *path,
 int juxta_log_read_file(struct juxta_log_context *ctx, const struct juxta_file_entry *entry,
 			uint32_t file_offset, uint8_t *buffer, size_t buffer_size,
 			size_t *bytes_read);
+/* BLE file transfer: CSV body only (no stored filename line, no #EOF trailer). */
+uint32_t juxta_log_transfer_payload_bytes(const struct juxta_file_entry *entry);
+int juxta_log_read_file_for_transfer(struct juxta_log_context *ctx,
+				     const struct juxta_file_entry *entry, uint32_t file_offset,
+				     uint8_t *buffer, size_t buffer_size, size_t *bytes_read);
 int juxta_log_recover_files(struct juxta_log_context *ctx);
 
 #endif /* JUXTA_LOG_H_ */

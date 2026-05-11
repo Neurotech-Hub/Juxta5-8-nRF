@@ -97,9 +97,19 @@ Bring-up and feature work are intentionally split into separate apps so each sub
   - [`Reference/nRF/applications/juxta-ble`](Reference/nRF/applications/juxta-ble)
   - [`Reference/nRF/samples/ble/peripheral`](Reference/nRF/samples/ble/peripheral)
 
+### `applications/juxta5-8-ble-range` (Implemented)
+- **Purpose**: Minimal two-device **BLE range** check. **Advertiser**: **non-connectable** legacy advertising only, local name **`JX_XXXXXX`** (same rule as production: last three bytes of the public identity as `%02X%02X%02X` after `JX_`). **Scanner**: passive scan bursts on a **~1 s** cadence; **LED on** if a matching name was seen in a **500 ms** window, **LED off** otherwise. **No** GATT, battery/SAADC, magnet, or deep sleep — flash and test.
+- **Role**: Build-time under **“Juxta5-8 BLE range test”** (`CONFIG_JUXTA_BLE_RANGE_ROLE_ADVERTISER` vs `CONFIG_JUXTA_BLE_RANGE_ROLE_SCANNER`). Scanner optional **`CONFIG_JUXTA_RANGE_PEER_NAME`**: exact peer name; if empty, any **`JX_` + six hex digits** except the scanner’s own identity name. The app’s [`Kconfig`](applications/juxta5-8-ble-range/Kconfig) **must** `source` Zephyr’s `Kconfig.zephyr` first: if an application has a root `Kconfig` file, Zephyr sets `KCONFIG_ROOT` to it instead of `${ZEPHYR_BASE}/Kconfig`, so omitting that `source` breaks configuration (undefined `GPIO`, `BT`, etc.).
+- **Build**:  
+  `west build -b Juxta5-8_nRF52840 applications/juxta5-8-ble-range -d applications/juxta5-8-ble-range/build/juxta5-8-ble-range`  
+  **Advertiser**: default `prj.conf` only. **Scanner**: add Kconfig fragment [`applications/juxta5-8-ble-range/scanner.conf`](applications/juxta5-8-ble-range/scanner.conf) in the nRF Connect build configuration, or from the repo root:  
+  `west build ... -- -DEXTRA_CONF_FILE=applications/juxta5-8-ble-range/scanner.conf`  
+  Uncomment / set `CONFIG_JUXTA_RANGE_PEER_NAME` in that file if you want an exact `JX_…` match.
+- **Bring-up with host tools**: Use [`applications/juxta5-8-ble-test`](applications/juxta5-8-ble-test) if you need connectable GATT, FUEL read, or magnet-wake sleep.
+
 ### `applications/juxta5-8-prod` (Implemented)
 - **Purpose**: Production Hublink firmware. Combines BLE peripheral advertising/scanning, LIS2DH12 motion/temperature, battery monitoring, and append-only NOR CSV logging (JXS settings/events, JXV vitals, JXB BLE observations). Settings persist in nRF52840 internal flash (NVS). External NOR holds only self-describing CSV log files recoverable by flash scan.
-- **BLE**: Hublink service UUIDs preserved for iOS compatibility. Node reports `firmware_version` 5.8.x plus `product`, `log_schema`, `logging_version`, `experiment`. Gateway accepts `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `operatingMode`, `scanInterval`, `vitalsInterval`, `subjectId`, `uploadPath`, `experiment`. File listing uses legacy `name|size;EOF` wire format. MTU exchange and 4 s supervision timeout requested on connect.
+- **BLE**: Hublink service UUIDs preserved for iOS compatibility. Node reports `firmware_version` 5.8.x plus `product`, `log_schema`, `logging_version`, `experiment`, `subject_id`, and `upload_path` (always **`/`**). Gateway accepts `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `scanInterval`, `vitalsInterval`, `subjectId`, `experiment`. Filename listing uses legacy `name|size;EOF` wire format; file transfer concludes with a standalone **`EOF`** (3-byte) indication after CSV data chunks. MTU exchange and 4 s supervision timeout requested on connect.
 - **Boot / shelf**: Fresh power-on → System OFF. Magnet wake → measure hold duration. < 7 s → normal wake (connectable adv, datetime sync required). ≥ 7 s → DFU stub (≥ 3.2 V required). Production magnet hold (not connected) → 5× blink → 5 s debounce → shelf. Debugger detected via `CoreDebug->DHCSR` and shelf/wake/DFU simulated in-band.
 - **Battery**: FUEL on P0.30/AIN6. Calibrated factor 7.96× (was 7.82). Brownout at 2.9 V → shelf; DFU access gated at 3.2 V; `low_battery` event logged in JXS before poweroff.
 - **NOR layout**: `0x000000–0x00FFFF` JXS (64 KB), `0x010000–0x10FFFF` JXV (1 MB), `0x110000–0x3FFFFF` JXB (3 MB).
@@ -153,10 +163,10 @@ Execution status:
 
 1. Build and flash `applications/juxta5-8-prod` for `Juxta5-8_nRF52840`.
 2. RTT should log device ID (`JX_XXXXXX`), NVS settings load, NOR log init, and a `boot` row appended to `JXS`.
-3. Connect with nRF Connect or the iOS companion app. Node characteristic should return JSON with `"firmware_version":"5.8.0"`, `"product":"Juxta5-8"`, `"log_schema":"jxta-nor-csv-v3"`.
+3. Connect with nRF Connect or the iOS companion app. Node characteristic should return JSON with `"firmware_version":"5.8.0"`, `"product":"Juxta5-8"`, `"log_schema":"jxta-nor-csv-v4"`.
 4. Write gateway JSON `{"timestamp":1746000000}`. RTT logs timestamp accepted; `JXS` gets a `time_set` row.
 5. Write gateway JSON `{"sendFilenames":true}`. Filename characteristic indication lists `JXS*.csv;JXV*.csv;JXB*.csv` with sizes.
-6. Write a listed filename to the filename characteristic. File-transfer indication stream delivers CSV bytes ending with `#EOF`.
+6. Write a listed filename to the filename characteristic. File-transfer stream: CSV-only data indications (payload byte count equals listing **size**), then one final **`EOF`** (3-byte) indication — not `#EOF`/NOR terminator in the CSV payload.
 7. Allow device to run one `vitals_interval_s`. RTT logs vitals; `JXV` byte count grows.
 8. With another `JX_XXXXXX` device nearby, let a scan cycle complete. RTT logs peers; `JXB` rows are appended.
 9. Write `{"clearMemory":true}`. NOR regions erase and fresh CSV files are created with a `memory_cleared` event. Internal settings survive (reconnect, read Node; `subject_id` and `experiment` unchanged).
@@ -167,4 +177,5 @@ Execution status:
 - `juxta5-8-axy`: implemented, runtime checklist pending hardware session
 - `juxta5-8-mem`: implemented; destructive-from-offset-0 checklist pending hardware session
 - `juxta5-8-ble-test`: implemented; BLE bring-up checklist executed on hardware
+- `juxta5-8-ble-range`: implemented; advertiser/scanner + LED range check pending hardware session
 - `juxta5-8-prod`: implemented; hardware + iOS validation pending board session

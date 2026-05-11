@@ -40,8 +40,6 @@ void juxta_settings_defaults(struct juxta_settings *settings, const char *device
 	memset(settings, 0, sizeof(*settings));
 	copy_string(settings->subject_id, sizeof(settings->subject_id),
 		    (device_id && device_id[0] != '\0') ? device_id : "JX_000000");
-	copy_string(settings->experiment, sizeof(settings->experiment), JUXTA_DEFAULT_EXPERIMENT);
-	copy_string(settings->mode, sizeof(settings->mode), JUXTA_DEFAULT_MODE);
 	copy_string(settings->upload_path, sizeof(settings->upload_path), JUXTA_DEFAULT_UPLOAD_PATH);
 	settings->scan_interval_s = JUXTA_DEFAULT_SCAN_INTERVAL_S;
 	settings->vitals_interval_s = JUXTA_DEFAULT_VITALS_INTERVAL_S;
@@ -87,21 +85,13 @@ static void sanitize_settings(struct juxta_settings *settings)
 {
 	settings->subject_id[sizeof(settings->subject_id) - 1] = '\0';
 	settings->experiment[sizeof(settings->experiment) - 1] = '\0';
-	settings->mode[sizeof(settings->mode) - 1] = '\0';
 	settings->upload_path[sizeof(settings->upload_path) - 1] = '\0';
 
 	if (settings->subject_id[0] == '\0') {
 		copy_string(settings->subject_id, sizeof(settings->subject_id), boot_device_id);
 	}
-	if (settings->experiment[0] == '\0') {
-		copy_string(settings->experiment, sizeof(settings->experiment), JUXTA_DEFAULT_EXPERIMENT);
-	}
-	if (settings->mode[0] == '\0') {
-		copy_string(settings->mode, sizeof(settings->mode), JUXTA_DEFAULT_MODE);
-	}
-	if (settings->upload_path[0] == '\0') {
-		copy_string(settings->upload_path, sizeof(settings->upload_path), JUXTA_DEFAULT_UPLOAD_PATH);
-	}
+	/* Fixed product policy: always `/` in RAM and on save (Node + NVS). */
+	copy_string(settings->upload_path, sizeof(settings->upload_path), JUXTA_UPLOAD_PATH_FIXED);
 	if (settings->scan_interval_s == 0U) {
 		settings->scan_interval_s = JUXTA_DEFAULT_SCAN_INTERVAL_S;
 	}
@@ -139,8 +129,8 @@ int juxta_settings_init(const char *device_id)
 		sanitize_settings(&current_settings);
 	}
 
-	LOG_INF("settings subject=%s experiment=%s mode=%s scan=%us vitals=%us",
-		current_settings.subject_id, current_settings.experiment, current_settings.mode,
+	LOG_INF("settings subject=%s experiment=%s scan=%us vitals=%us",
+		current_settings.subject_id, current_settings.experiment,
 		current_settings.scan_interval_s, current_settings.vitals_interval_s);
 	return 0;
 }

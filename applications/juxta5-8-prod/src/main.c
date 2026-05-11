@@ -17,6 +17,7 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -157,6 +158,15 @@ static struct k_timer wdt_feed_timer;
 static void wdt_feed_timer_cb(struct k_timer *timer)
 {
 	ARG_UNUSED(timer);
+	if (wdt && wdt_channel_id >= 0) {
+		(void)wdt_feed(wdt, wdt_channel_id);
+	}
+}
+
+/* Also call from long paths (NOR append burst, BLE state machine) so a blocked
+ * system workqueue cannot miss enough periodic timer-based feeds to hit WDT. */
+static void prod_wdt_feed(void)
+{
 	if (wdt && wdt_channel_id >= 0) {
 		(void)wdt_feed(wdt, wdt_channel_id);
 	}
@@ -383,6 +393,18 @@ static volatile bool datetime_synchronized;
 static volatile bool ble_connected;
 static bool hardware_ready;
 
+/* Forward declarations for BLE state — defined in the operational state machine
+ * section below, but referenced earlier by vitals_work_handler. */
+typedef enum {
+	BLE_STATE_IDLE = 0,
+	BLE_STATE_ADVERTISING,
+	BLE_STATE_SCANNING,
+#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
+	BLE_STATE_CONNECTABLE_ADV,
+#endif
+} ble_state_t;
+static ble_state_t ble_state;
+
 /* ---------------------------------------------------------------------------
  * Vitals (once per vitals_interval_s)
  * -------------------------------------------------------------------------*/
@@ -392,24 +414,45 @@ static struct k_timer vitals_timer;
 static void vitals_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
+	LOG_INF("vitals: fired hw_ready=%d ble_state=%d", hardware_ready, (int)ble_state);
 	if (!hardware_ready) {
 		return;
 	}
 
-	uint32_t now = juxta_time_now();
-	int8_t temp_c = 0;
-
+	/* Always read sensors to keep data fresh and drain motion count. */
+	prod_wdt_feed();
+	LOG_INF("vitals: reading battery");
 	(void)sample_battery_mv();
+	LOG_INF("vitals: battery done batt_mv=%ld", (long)g_batt_mv);
+	int8_t temp_c = 0;
+	LOG_INF("vitals: reading temp");
 	(void)lis2dh12_zephyr_read_temp_c(&lis2dh12, &temp_c);
+	LOG_INF("vitals: temp done temp_c=%d", (int)temp_c);
 
 	uint8_t motion = (uint8_t)MIN(motion_events, 255U);
 	motion_events = 0;
 
-	(void)juxta_log_append_vitals(&log_ctx, now, motion, g_batt_mv, temp_c);
+	/* Skip NOR write while the radio is actively scanning: the SPI bus is
+	 * shared and a concurrent scan burst adds latency.  The next vitals
+	 * tick will write the row; one sample is acceptable to skip. */
+	if (ble_state == BLE_STATE_SCANNING) {
+		LOG_INF("vitals: deferring NOR write (scan active)");
+		return;
+	}
+	LOG_INF("vitals: writing NOR");
+
+	uint32_t now = juxta_time_now();
+
+	int vitals_rc = juxta_log_append_vitals(&log_ctx, now, motion, g_batt_mv, temp_c);
+
+	prod_wdt_feed();
+	LOG_INF("vitals: NOR write done rc=%d", vitals_rc);
 
 	/* Brownout safeguard: log the event then return to shelf mode.
-	 * This fires once per vitals tick so the device doesn't log-storm. */
-	if (g_batt_mv > 0 && g_batt_mv < BATT_BROWNOUT_MV) {
+	 * This fires once per vitals tick so the device doesn't log-storm.
+	 * Skip in debug mode: without a battery the ADC reads garbage mV. */
+	bool vitals_debug = (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0U;
+	if (!vitals_debug && g_batt_mv > 0 && g_batt_mv < BATT_BROWNOUT_MV) {
 		LOG_WRN("Battery critical (%ld mV < %u mV) — logging low_battery, entering shelf",
 			(long)g_batt_mv, BATT_BROWNOUT_MV);
 		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
@@ -443,7 +486,15 @@ typedef struct {
 } scan_event_t;
 K_MSGQ_DEFINE(scan_event_q, sizeof(scan_event_t), SCAN_EVENT_QUEUE_SIZE, 4);
 
+/* Opportunistic connectable advertising after overhearing JXGA_* in scan (only after
+ * ProductionInit). Set to 1 to re-enable. */
+#ifndef JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
+#define JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV 0
+#endif
+
+#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
 static bool do_gateway_adv;
+#endif
 
 static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
 		    struct net_buf_simple *ad)
@@ -487,9 +538,13 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
 		(void)snprintf(evt.peer_id, sizeof(evt.peer_id), "%s", dev_name);
 		evt.rssi = rssi;
 		(void)k_msgq_put(&scan_event_q, &evt, K_NO_WAIT);
+#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
 	} else if (strncmp(dev_name, "JXGA_", 5) == 0) {
 		do_gateway_adv = true;
 	}
+#else
+	}
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -598,7 +653,6 @@ static int start_scanning(void)
 	};
 
 	(void)bt_le_adv_stop();
-	k_sleep(K_MSEC(100));
 
 	int rc = bt_le_scan_start(&scan_param, scan_cb);
 
@@ -672,15 +726,28 @@ static void flush_scan_table(void)
 {
 	uint32_t now = juxta_time_now();
 
+	LOG_INF("flush_scan_table: start cnt=%u ts=%u", scan_count, now);
 	for (uint8_t i = 0; i < scan_count; i++) {
-		(void)juxta_log_append_ble_observation(&log_ctx, now, device_id,
-						       scan_table[i].peer_id,
-						       scan_table[i].rssi);
+		LOG_INF("flush_scan_table: append %u/%u peer=%s rssi=%d", i + 1U, scan_count,
+			scan_table[i].peer_id, scan_table[i].rssi);
+		int rc = juxta_log_append_ble_observation(&log_ctx, now, device_id,
+							  scan_table[i].peer_id,
+							  scan_table[i].rssi);
+
+		if (rc != 0) {
+			LOG_WRN("flush_scan_table: JXB append failed rc=%d", rc);
+		}
+		if ((i & 0x07U) == 0x07U) {
+			prod_wdt_feed();
+			k_yield();
+		}
 	}
+	prod_wdt_feed();
 
 	LOG_INF("Scan burst: %u unique peers", scan_count);
 	scan_count = 0;
 	memset(scan_table, 0, sizeof(scan_table));
+	LOG_INF("flush_scan_table: done");
 }
 
 static void process_scan_events(void)
@@ -711,18 +778,12 @@ static void process_scan_events(void)
 /* ---------------------------------------------------------------------------
  * Operational state machine
  * -------------------------------------------------------------------------*/
-#define ADV_BURST_MS   500U
-#define SCAN_BURST_MS  3000U
+#define ADV_BURST_MS  500U
+#define SCAN_BURST_MS 3000U
+#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
 #define GATEWAY_ADV_MS 30000U
+#endif
 
-typedef enum {
-	BLE_STATE_IDLE = 0,
-	BLE_STATE_ADVERTISING,
-	BLE_STATE_SCANNING,
-	BLE_STATE_CONNECTABLE_ADV,
-} ble_state_t;
-
-static ble_state_t ble_state = BLE_STATE_IDLE;
 static uint32_t last_adv_ts;
 static uint32_t last_scan_ts;
 static struct k_work state_work;
@@ -742,6 +803,32 @@ static uint32_t get_adv_interval_s(void)
 static uint32_t get_scan_interval_s(void)
 {
 	return juxta_settings_get()->scan_interval_s;
+}
+
+/* uint64 deadlines avoid uint32 wrap in (last + interval) vs now. */
+static bool interval_elapsed(uint32_t now, uint32_t last, uint32_t interval_s)
+{
+	uint64_t end = (uint64_t)last + (uint64_t)interval_s;
+
+	return (uint64_t)now >= end;
+}
+
+/* Seconds remaining until (last + interval); 0 if already elapsed. */
+static uint32_t seconds_until(uint32_t now, uint32_t last, uint32_t interval_s)
+{
+	uint64_t now64 = (uint64_t)now;
+	uint64_t end = (uint64_t)last + (uint64_t)interval_s;
+
+	if (now64 >= end) {
+		return 0U;
+	}
+	uint64_t rem = end - now64;
+	const uint64_t cap = 86400ULL * 7ULL;
+
+	if (rem > cap) {
+		return (uint32_t)cap;
+	}
+	return (uint32_t)rem;
 }
 
 static void state_timer_cb(struct k_timer *timer)
@@ -765,23 +852,28 @@ static void state_work_handler(struct k_work *work)
 		ble_state = BLE_STATE_IDLE;
 	}
 
+#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
 	if (ble_state == BLE_STATE_CONNECTABLE_ADV) {
 		(void)bt_le_adv_stop();
 		ble_state = BLE_STATE_IDLE;
 	}
+#endif
 
 	if (ble_state == BLE_STATE_SCANNING) {
+		LOG_INF("state: scan burst ending — stopping scanner");
 		(void)bt_le_scan_stop();
 		process_scan_events();
 		flush_scan_table();
 		last_scan_ts = now;
 		ble_state = BLE_STATE_IDLE;
+		LOG_INF("state: scan burst complete — idle");
 	}
 
 	if (ble_state != BLE_STATE_IDLE) {
 		return;
 	}
 
+#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
 	if (do_gateway_adv) {
 		do_gateway_adv = false;
 		if (start_connectable_adv() == 0) {
@@ -790,9 +882,10 @@ static void state_work_handler(struct k_work *work)
 			return;
 		}
 	}
+#endif
 
-	bool scan_due = (now >= last_scan_ts + get_scan_interval_s());
-	bool adv_due  = (now >= last_adv_ts  + get_adv_interval_s());
+	bool scan_due = interval_elapsed(now, last_scan_ts, get_scan_interval_s());
+	bool adv_due = interval_elapsed(now, last_adv_ts, get_adv_interval_s());
 
 	if (scan_due) {
 		if (start_scanning() == 0) {
@@ -811,14 +904,23 @@ static void state_work_handler(struct k_work *work)
 		}
 	}
 
-	uint32_t wait_adv = (now < last_adv_ts + get_adv_interval_s())
-				    ? (last_adv_ts + get_adv_interval_s() - now) : 0U;
-	uint32_t wait_scan = (now < last_scan_ts + get_scan_interval_s())
-				     ? (last_scan_ts + get_scan_interval_s() - now) : 0U;
+	uint32_t wait_adv = seconds_until(now, last_adv_ts, get_adv_interval_s());
+	uint32_t wait_scan = seconds_until(now, last_scan_ts, get_scan_interval_s());
 	uint32_t next_s = MIN(wait_adv, wait_scan);
 	uint32_t jitter_ms = sys_rand32_get() % 1000U;
+	/* Cap so next_s * 1000 + jitter never overflows uint32 and K_MSEC stays sane. */
+	uint32_t capped_s = MIN(next_s, 3600U);
+	uint32_t delay_ms = capped_s * 1000U + jitter_ms;
 
-	k_timer_start(&state_timer, K_MSEC((uint64_t)next_s * 1000U + jitter_ms), K_NO_WAIT);
+	if (delay_ms < capped_s * 1000U) {
+		delay_ms = UINT32_MAX / 4U;
+	}
+	if (delay_ms > (uint32_t)INT_MAX) {
+		delay_ms = (uint32_t)INT_MAX;
+	}
+
+	k_timer_start(&state_timer, K_MSEC((int32_t)delay_ms), K_NO_WAIT);
+	prod_wdt_feed();
 }
 
 /* ---------------------------------------------------------------------------
@@ -876,14 +978,24 @@ int main(void)
 	(void)gpio_pin_configure_dt(&accel_int, GPIO_INPUT);
 
 	/* ----------------------------------------------------------------
-	 * Step 2: LED timer/work — initialized early so set_led_mode()
+	 * Step 2: Watchdog — must be first after GPIO so the feed timer
+	 * is running on every boot, including after soft-reboots caused
+	 * by faults.  The nRF52840 WDT cannot be stopped once started and
+	 * keeps counting through sys_reboot(); if init is deferred until
+	 * after the magnet-wait loop the 30 s window can expire before
+	 * the feed timer restarts, producing RESETREAS=0x00000002 cascades.
+	 * -------------------------------------------------------------- */
+	(void)init_watchdog();
+
+	/* ----------------------------------------------------------------
+	 * Step 3: LED timer/work — initialized early so set_led_mode()
 	 * works throughout the entire boot sequence.
 	 * -------------------------------------------------------------- */
 	k_work_init(&led_work, led_work_handler);
 	k_timer_init(&led_timer, led_timer_cb, NULL);
 
 	/* ----------------------------------------------------------------
-	 * Step 2b: Early battery sample — needed before DFU gate and
+	 * Step 3b: Early battery sample — needed before DFU gate and
 	 * brownout check which both occur before the main ADC init step.
 	 * Skip in debugger mode so a drained bench supply doesn't block
 	 * development workflows.
@@ -986,11 +1098,6 @@ int main(void)
 			}
 		}
 	}
-
-	/* ----------------------------------------------------------------
-	 * Step 4: Watchdog
-	 * -------------------------------------------------------------- */
-	(void)init_watchdog();
 
 	/* ----------------------------------------------------------------
 	 * Step 5: Battery ADC

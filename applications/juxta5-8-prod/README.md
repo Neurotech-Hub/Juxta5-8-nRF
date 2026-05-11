@@ -45,13 +45,35 @@ Slow blink (50 ms ON / 450 ms OFF) — waiting for iOS connection
 IDLE
  ├─ scan interval elapsed  → SCANNING (3 s passive burst) → flush JXB rows → IDLE
  ├─ adv interval elapsed   → ADVERTISING (0.5 s non-conn) → IDLE
- ├─ JXGA_ beacon seen      → CONNECTABLE_ADV (30 s)       → IDLE
  └─ iOS connects           → CONNECTED (radio owned by BT stack)
                                      └─ disconnect → IDLE
+
+(JXGA_ overheard in scan → 30 s connectable “gateway” adv: **disabled** in default build;
+re-enable with `-DJUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=1` or define the macro to 1 in `main.c`.)
 
 Parallel vitals timer (every vitals_interval_s):
   LIS2DH12 temp + SAADC batt_mv + motion count → append JXV row
 ```
+
+### Scanning vs advertising (operational BLE)
+
+After **production init** (`hardware_ready`), the device never runs **non-connectable advertising** and **passive scanning** at the same time. **Opportunistic connectable advertising** after overhearing a **`JXGA_`** name is **disabled** by default (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` = 0 unless overridden at compile time; default in [`src/main.c`](src/main.c)). A **`k_timer`** (`state_timer`) wakes a **`k_work`** handler (`state_work_handler`) on a schedule; each invocation **tears down** whatever phase was active (stop adv and/or stop scan), returns to an internal **IDLE** bookkeeping state, then optionally starts **one** new phase.
+
+**Phases (mutually exclusive on the radio during normal operation)**
+
+| Phase | What starts | How long (`state_timer`) | Purpose |
+|--------|-------------|---------------------------|---------|
+| **Non-connectable advertising** | `start_nonconn_adv()` — fast interval, name in AD only | `ADV_BURST_MS` (**500 ms**) | Broadcast `JX_…` identity so other Juxta units can see us |
+| **Passive scanning** | `start_scanning()` — stops any adv first, 100 ms gap, then `bt_le_scan_start` | `SCAN_BURST_MS` (**3000 ms**) | Listen for peer `JX_…` names; queue events for **JXB** logging after the burst |
+| **Connectable “gateway” advertising** (optional) | `start_connectable_adv()` (Hublink, full GATT) | `GATEWAY_ADV_MS` (**30 s**) | When `JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` is **1**: after a **`JXGA_`** name is overheard in scan, open a connectable window for an iOS gateway. **Default build: disabled.** |
+
+**When both “due”, scan wins.** After going IDLE, the handler evaluates **`scan_due`** (`juxta_time_now()` ≥ `last_scan_ts` + **`scan_interval_s`** from NVS / Gateway), then **`adv_due`** (≥ `last_adv_ts` + **`ADV_INTERVAL_S`**, fixed **10 s** in firmware). If `JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` is enabled, **`do_gateway_adv`** (set when a scanned name begins with **`JXGA_`**) is evaluated **before** `scan_due` / `adv_due`. If nothing applies, it programs the timer for the **earlier** of the next scan vs adv deadline, plus a small **random jitter** (0–999 ms) to desynchronize colliding devices.
+
+**Timing note:** `scan_due` / `adv_due` are driven by **`juxta_time_now()` in whole seconds**, so **`ADV_BURST_MS` (500) and `SCAN_BURST_MS` (3000) are not a harmful “divisor” relationship** for the state machine—bursts are sequential one-shots. **Idle-period jitter** (0–999 ms on the next sleep) is what spreads out **peer** wakeups when many devices use similar `scan_interval_s` / `ADV_INTERVAL_S`; it does not randomize burst lengths. Repeated **ties** on the same second are more likely when `scan_interval_s` is a multiple of **10** (same as `ADV_INTERVAL_S`) than from 3000 being 6×500.
+
+**While an iOS client is connected** (`ble_connected`), the work handler **returns immediately** — the stack owns the connection; scan/adv cycling resumes from **IDLE** after disconnect (see `on_disconnected` in the same file).
+
+**Magnet shelf path:** if the user holds the magnet (not connected), firmware stops adv and scan, forces **IDLE**, then enters shelf after the debounce sequence — same “radio off before shelf” idea.
 
 ---
 
@@ -81,15 +103,13 @@ stateDiagram-v2
 
     IDLE --> SCANNING : scan interval elapsed
     IDLE --> ADVERTISING : adv interval elapsed
-    IDLE --> CONNECTABLE_ADV : JXGA_ beacon seen
+    %% JXGA_ connectable gateway adv (CONNECTABLE_ADV) disabled when JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=0
 
     SCANNING --> IDLE : 3 s burst done\nflush JXB rows
     ADVERTISING --> IDLE : 0.5 s burst done
-    CONNECTABLE_ADV --> IDLE : 30 s timeout
 
     IDLE --> CONNECTED : iOS connects
     SCANNING --> CONNECTED : iOS connects
-    CONNECTABLE_ADV --> CONNECTED : iOS connects
 
     CONNECTED --> IDLE : disconnected\nresume state machine
 
@@ -136,48 +156,46 @@ Single JSON object. iOS reads this once on connect.
 
 ```json
 {
-  "upload_path": "/TEST",
+  "upload_path": "/",
   "firmware_version": "5.8.0",
   "battery_level": 87,
   "device_id": "JX_9B10A1",
-  "operating_mode": 0,
   "alert": "",
   "product": "Juxta5-8",
-  "log_schema": "jxta-nor-csv-v3",
-  "logging_version": 3,
-  "experiment": "social_v1"
+  "log_schema": "jxta-nor-csv-v4",
+  "logging_version": 4,
+  "experiment": "",
+  "subject_id": "JX_9B10A1"
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `upload_path` | string | iOS upload destination path |
+| `upload_path` | string | Always **`/`** (hard-coded in firmware; not NVS-configurable) |
 | `firmware_version` | string | Semantic version; `5.8.x` signals NOR CSV decoder |
 | `battery_level` | integer 0–100 | Percent, derived from SAADC voltage (3.0 V = 0 %, 4.2 V = 100 %) |
 | `device_id` | string | Stable hardware ID `JX_XXXXXX` (last 3 MAC bytes); never changes |
-| `operating_mode` | integer | `0` = normal; reserved, no ADC mode on this hardware |
 | `alert` | string | Reserved for future device alerts; currently always `""` |
 | `product` | string | `"Juxta5-8"` — tells iOS to use the NOR CSV decoder |
-| `log_schema` | string | `"jxta-nor-csv-v3"` — identifies the log format version |
-| `logging_version` | integer | `3` — integer decoder selector |
-| `experiment` | string | Current experiment string from NVS settings |
+| `log_schema` | string | `"jxta-nor-csv-v4"` — identifies the log format version |
+| `logging_version` | integer | `4` — integer decoder selector |
+| `experiment` | string | Current experiment string from NVS settings (empty until set via Gateway) |
+| `subject_id` | string | Current subject assignment from NVS (same value Gateway may set as `subjectId`) |
 
 ---
 
 ### Gateway characteristic (WRITE → device)
 
-JSON object; any subset of keys may be sent. Unrecognized keys are silently ignored.
+JSON object; any subset of keys may be sent. Unrecognized keys are silently ignored. **`uploadPath`** is not applied (Node `upload_path` is fixed to **`/`**).
 
 ```json
 {
   "timestamp": 1746000000,
   "sendFilenames": true,
   "clearMemory": true,
-  "operatingMode": 0,
   "scanInterval": 30,
   "vitalsInterval": 60,
   "subjectId": "mouse_07",
-  "uploadPath": "/social_v1",
   "experiment": "social_v1"
 }
 ```
@@ -188,11 +206,9 @@ JSON object; any subset of keys may be sent. Unrecognized keys are silently igno
 | `sendFilenames` | bool | Triggers file listing indication on Filename characteristic |
 | `clearMemory` | bool | Erases all NOR CSV regions; creates fresh daily files; appends `memory_cleared` to JXS; **does not clear NVS settings** |
 | `reset` | bool | Immediately enters shelf mode (System OFF in production; soft reboot in debug) |
-| `operatingMode` | integer | Stored in NVS `mode`; no behavioral effect on this hardware (ADC mode removed) |
 | `scanInterval` | integer (seconds) | BLE scan interval; stored in NVS; appends `settings_changed` to JXS |
 | `vitalsInterval` | integer (seconds) | Vitals logging interval; stored in NVS; appends `settings_changed` to JXS |
 | `subjectId` | string | Subject assignment; stored in NVS; appends `settings_changed` to JXS |
-| `uploadPath` | string | iOS upload path prefix; stored in NVS |
 | `experiment` | string | Experiment grouping string; stored in NVS; appends `settings_changed` to JXS |
 
 ---
@@ -205,7 +221,7 @@ Triggered by `"sendFilenames": true` in a Gateway write, or by writing `"LIST"` 
 JXS20260507.csv|2048;JXV20260507.csv|14592;JXB20260507.csv|30720
 ```
 
-Each entry is `filename|size_in_bytes`. The size for active (open) files includes the synthetic `#EOF` marker that will be appended during transfer.
+Each entry is `filename|size_in_bytes`. **Size** is the **CSV payload** byte count on File Transfer (no leading filename line, no NOR `#EOF` line in that count). A separate **standalone** File Transfer indication with payload **`EOF`** (3 ASCII bytes) follows all data indications and is **not** included in **size**.
 
 ---
 
@@ -213,10 +229,11 @@ Each entry is `filename|size_in_bytes`. The size for active (open) files include
 
 1. iOS writes the desired filename to the **Filename** characteristic (e.g. `JXV20260507.csv`).
 2. The device streams the file as a sequence of **indications** on the **File Transfer** characteristic.
-   - Each indication payload is `min(MTU − 3, 512)` bytes.
+   - Data payloads are **CSV only**: the first line stored on NOR (`filename.csv`) is skipped; indications start at the CSV header row. The NOR `#EOF` line is **not** sent as file bytes.
+   - Each data indication payload is up to `min(MTU − 3, 512)` bytes (last chunk may be short).
    - The device waits for each indication confirmation before sending the next chunk.
-3. The final indication contains the literal string `#EOF` (5 bytes), signalling end of file.
-4. iOS should request MTU exchange to 247 bytes for optimal throughput (~244 bytes/indication).
+3. After all data chunks, the peripheral sends **one** final indication on File Transfer whose value is exactly the string **`EOF`** (three bytes — gateway end-of-transfer marker). This is distinct from the Filename listing terminator `EOF` and from the `#EOF` line stored on NOR when a file closes.
+4. iOS should request MTU exchange to 247 bytes for optimal throughput (~244 bytes per data indication).
 
 ---
 
@@ -272,15 +289,15 @@ applications/juxta5-8-prod/
 | LED blink sequences | Magnet hold: solid ON; DFU entry: 3× 200 ms blink; production init: 5× 50 ms blink |
 | Datetime sync gate | Connectable adv after normal wake; loops indefinitely until timestamp received; must have timestamp before production init |
 | Watchdog | 30 s window, fed every 10 s, pauses on debug halt |
-| NVS settings | `subject_id`, `experiment`, `mode`, `scan_interval_s`, `vitals_interval_s`, `upload_path` |
+| NVS settings | `subject_id`, `experiment`, `scan_interval_s`, `vitals_interval_s` (plus `upload_path` slot always written as **`/`**; reserved bytes for legacy blob layout) |
 | NOR CSV logging | JXS events, JXV vitals, JXB BLE observations; append-only, `#EOF` on close |
 | Log-state cache | MCU NVS caches file offsets; scans NOR on cache miss |
-| BLE state machine | Non-conn advertising bursts (10 s interval), passive scan bursts (configurable), JXGA_ gateway detection |
+| BLE state machine | Non-conn advertising bursts (10 s interval), passive scan bursts (configurable); JXGA_ opportunistic connectable adv **disabled** in source (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV`) |
 | Battery level in Node JSON | SAADC mV sampled on connect and each vitals tick; calibrated factor 7.96×; linear 3.0–4.2 V → 0–100 % |
 | Battery safeguards | Brownout < 2.9 V → shelf mode (boot + vitals timer, logs `low_battery`); DFU gate < 3.2 V → falls back to normal wake |
 | Hublink GATT service | Node, Gateway, Filename, File Transfer characteristics; UUIDs match iOS companion |
 | Node JSON | Legacy keys + `product`, `log_schema`, `logging_version`, `experiment` (5.8 fields) |
-| Gateway commands | `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `operatingMode`, `scanInterval`, `vitalsInterval`, `subjectId`, `uploadPath`, `experiment` |
+| Gateway commands | `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `scanInterval`, `vitalsInterval`, `subjectId`, `experiment` |
 | BLE connection optimisation | MTU exchange initiated on connect; supervision timeout 4 s; preferred interval 30–50 ms via `bt_conn_le_param_update` |
 | Production magnet-to-shelf | Magnet held in production (not connected) → 5× blink → 5 s debounce → shelf mode |
 | Debugger simulation loop | `CoreDebug->DHCSR` detects J-Link; simulates shelf/wake/DFU cycle in-band; `sys_reboot()` restarts loop |
@@ -294,8 +311,9 @@ applications/juxta5-8-prod/
 
 | Feature | Notes |
 |---|---|
+| **JXGA_ opportunistic gateway adv** | Post–ProductionInit connectable advertising after overhearing `JXGA_*` in scan is **compiled out** (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` = 0). Re-enable with `-DJUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=1` or by defining the macro to **1** before the `#ifndef` in `main.c`. |
 | **DFU mode** | `enter_dfu_mode()` is a halting stub. Requires MCUboot SMP BLE stack (`CONFIG_MCUMGR`, `CONFIG_IMG_MANAGER`, SMP Bluetooth transport). DFU advertising name and behavior to be defined. |
 | **Advertising interval setting** | `advInterval` gateway key is logged but not applied; advertising uses `ADV_INTERVAL_S = 10` build constant. |
 | **Daily file rotation** | New date-named files are created when `juxta_time_now()` crosses midnight. Requires the clock to be valid; files accumulate until `clearMemory`. |
-| **iOS companion decoder** | iOS app needs a branch path for `log_schema: jxta-nor-csv-v3` to parse JXS/JXV/JXB CSV files instead of legacy FRAMFS binary blobs. |
+| **iOS companion decoder** | iOS app needs a branch path for `log_schema: jxta-nor-csv-v4` (JXS without `mode` column) to parse JXS/JXV/JXB CSV files instead of legacy FRAMFS binary blobs. |
 | **Hardware validation** | Full boot/magnet/datetime/scan/vitals/transfer sequence tested on hardware; extended field deployment pending. |
