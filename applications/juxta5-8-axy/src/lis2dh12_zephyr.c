@@ -221,6 +221,29 @@ int lis2dh12_zephyr_config_motion(struct lis2dh12_dev *dev, uint8_t threshold, u
 	return 0;
 }
 
+int lis2dh12_zephyr_power_down(struct lis2dh12_dev *dev)
+{
+	if (!dev || !dev->initialized) {
+		return -EINVAL;
+	}
+
+	uint8_t ctrl1 = 0;
+	int ret = platform_read(NULL, 0x20, &ctrl1, 1);
+	if (ret < 0) {
+		return ret;
+	}
+
+	ctrl1 &= 0x0FU; /* ODR[3:0] = 0000: power-down mode. */
+	ret = platform_write(NULL, 0x20, &ctrl1, 1);
+	if (ret < 0) {
+		LOG_ERR("Failed LIS2DH12 power-down");
+		return ret;
+	}
+
+	LOG_INF("LIS2DH12 powered down");
+	return 0;
+}
+
 int lis2dh12_zephyr_read_int1_src(struct lis2dh12_dev *dev, uint8_t *int1_src)
 {
 	if (!dev || !dev->initialized || !int1_src) {

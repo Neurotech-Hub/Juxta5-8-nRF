@@ -91,6 +91,9 @@ static led_mode_t led_mode;
 static bool led_phase;
 static struct k_work led_work;
 static struct k_timer led_timer;
+static struct k_work_delayable shelf_work;
+
+static void enter_shelf_mode(void);
 
 static void led_timer_cb(struct k_timer *timer)
 {
@@ -138,6 +141,12 @@ static void set_led_mode(led_mode_t mode)
 	led_mode = mode;
 	led_phase = true;
 	k_work_submit(&led_work);
+}
+
+static void shelf_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	enter_shelf_mode();
 }
 
 /* Blocking blink sequence; stops any running LED mode first. */
@@ -264,6 +273,8 @@ static int sample_battery_mv(void)
  * then MAG_INT is armed as a GPIO_INT_LEVEL_ACTIVE wake source and the nRF52840
  * enters System OFF. Cold boot on magnet application, RESETREAS[OFF] set.
  * -------------------------------------------------------------------------*/
+static void prepare_for_shelf_mode(void);
+
 static void enter_shelf_mode(void)
 {
 	bool debug = (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0U;
@@ -279,6 +290,7 @@ static void enter_shelf_mode(void)
 	}
 
 	LOG_INF("Shelf mode: entering System OFF — wake on magnet (P0.25 LOW)");
+	prepare_for_shelf_mode();
 
 	/* 1× short blink confirms this path was reached (visible on hardware). */
 	gpio_pin_set_dt(&led, 1);
@@ -331,6 +343,7 @@ static int64_t measure_magnet_hold(void)
 /* Device identity is needed by both normal boot and early DFU entry. */
 static char device_id[JUXTA_DEVICE_ID_LEN];
 static char adv_name[JUXTA_DEVICE_ID_LEN];
+static bool bt_ready;
 
 /* Forward declarations — defined below but used by early DFU entry. */
 static void derive_device_id(void);
@@ -360,6 +373,7 @@ static void enter_dfu_mode(void)
 		LOG_ERR("DFU BT init failed: %d", rc);
 		return;
 	}
+	bt_ready = true;
 #if defined(CONFIG_MCUMGR_TRANSPORT_BT_DYNAMIC_SVC_REGISTRATION)
 	rc = smp_bt_register();
 	if (rc != 0 && rc != -EALREADY)
@@ -403,6 +417,8 @@ static void enter_dfu_mode(void)
 static struct lis2dh12_dev lis2dh12;
 static struct gpio_callback accel_int_cb;
 static volatile uint32_t motion_events;
+static bool accel_ready;
+static bool accel_irq_ready;
 /* Updated each vitals tick from motion since last tick; drives scan doubling. */
 static bool last_vitals_period_zero_motion;
 
@@ -424,6 +440,7 @@ static int init_accel(void)
 	{
 		return rc;
 	}
+	accel_ready = true;
 	rc = lis2dh12_zephyr_config_motion(&lis2dh12, 10U, 0U);
 	if (rc != 0)
 	{
@@ -431,8 +448,12 @@ static int init_accel(void)
 	}
 	gpio_init_callback(&accel_int_cb, accel_int_callback, BIT(accel_int.pin));
 	rc = gpio_add_callback(accel_int.port, &accel_int_cb);
-	rc |= gpio_pin_interrupt_configure_dt(&accel_int, GPIO_INT_EDGE_TO_ACTIVE);
-	return rc;
+	if (rc != 0)
+	{
+		return rc;
+	}
+	accel_irq_ready = true;
+	return gpio_pin_interrupt_configure_dt(&accel_int, GPIO_INT_EDGE_TO_ACTIVE);
 }
 
 /* ---------------------------------------------------------------------------
@@ -472,6 +493,7 @@ static struct k_work state_work;
  * -------------------------------------------------------------------------*/
 static struct k_work vitals_work;
 static struct k_timer vitals_timer;
+static bool app_timers_ready;
 
 static void vitals_work_handler(struct k_work *work)
 {
@@ -1086,6 +1108,69 @@ static void state_work_handler(struct k_work *work)
 	prod_wdt_feed();
 }
 
+static void disconnect_conn_sink(struct bt_conn *conn, void *user_data)
+{
+	ARG_UNUSED(user_data);
+	(void)bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+}
+
+static void prepare_for_shelf_mode(void)
+{
+	int rc;
+
+	if (app_timers_ready)
+	{
+		k_timer_stop(&state_timer);
+		k_timer_stop(&vitals_timer);
+		(void)k_work_cancel(&state_work);
+		(void)k_work_cancel(&vitals_work);
+		app_timers_ready = false;
+	}
+
+	k_timer_stop(&led_timer);
+	(void)gpio_pin_set_dt(&led, 0);
+
+	if (bt_ready)
+	{
+		(void)bt_le_adv_stop();
+		(void)bt_le_scan_stop();
+		ble_state = BLE_STATE_IDLE;
+
+		bt_conn_foreach(BT_CONN_TYPE_LE, disconnect_conn_sink, NULL);
+		k_sleep(K_MSEC(200));
+
+		rc = bt_disable();
+		if (rc != 0)
+		{
+			LOG_WRN("BT disable before shelf failed (%d)", rc);
+		}
+		else
+		{
+			bt_ready = false;
+			ble_connected = false;
+		}
+	}
+
+	if (accel_irq_ready)
+	{
+		(void)gpio_pin_interrupt_configure_dt(&accel_int, GPIO_INT_DISABLE);
+		(void)gpio_remove_callback(accel_int.port, &accel_int_cb);
+		accel_irq_ready = false;
+	}
+
+	if (accel_ready)
+	{
+		rc = lis2dh12_zephyr_power_down(&lis2dh12);
+		if (rc != 0)
+		{
+			LOG_WRN("LIS2DH12 power-down before shelf failed (%d)", rc);
+		}
+	}
+
+	(void)gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
+	(void)gpio_pin_configure_dt(&accel_int, GPIO_INPUT);
+}
+
 /* ---------------------------------------------------------------------------
  * Callbacks required by ble_service.c
  * -------------------------------------------------------------------------*/
@@ -1115,11 +1200,10 @@ void juxta_ble_datetime_synchronized(void)
 void juxta_ble_reset_requested(void)
 {
 	/* Called from the BT RX thread via the gateway "reset" command.
-	 * Stop radio, give BLE stack a moment to send the disconnect, then
-	 * enter shelf mode.  enter_shelf_mode() does not return. */
+	 * Schedule shelf entry onto the system workqueue so Bluetooth teardown
+	 * does not run directly inside the GATT write callback. */
 	LOG_INF("Gateway reset: entering shelf mode");
-	k_sleep(K_MSEC(200)); /* allow BLE disconnect PDU to be sent */
-	enter_shelf_mode();
+	(void)k_work_reschedule(&shelf_work, K_MSEC(10));
 }
 
 /* ---------------------------------------------------------------------------
@@ -1157,6 +1241,7 @@ int main(void)
 	 * works throughout the entire boot sequence.
 	 * -------------------------------------------------------------- */
 	k_work_init(&led_work, led_work_handler);
+	k_work_init_delayable(&shelf_work, shelf_work_handler);
 	k_timer_init(&led_timer, led_timer_cb, NULL);
 
 	/* ----------------------------------------------------------------
@@ -1306,6 +1391,7 @@ int main(void)
 		LOG_ERR("BT init failed: %d", rc);
 		return rc;
 	}
+	bt_ready = true;
 
 	juxta_time_init();
 	derive_device_id();
@@ -1370,6 +1456,7 @@ int main(void)
 	k_work_init(&vitals_work, vitals_work_handler);
 	k_timer_init(&state_timer, state_timer_cb, NULL);
 	k_timer_init(&vitals_timer, vitals_timer_cb, NULL);
+	app_timers_ready = true;
 
 	const struct juxta_settings *settings = juxta_settings_get();
 

@@ -84,6 +84,19 @@ After **production init** (`hardware_ready`), the device never runs **non-connec
 
 **Magnet shelf path:** if the user holds the magnet (not connected), firmware stops adv and scan, forces **IDLE**, then enters shelf after the debounce sequence — same “radio off before shelf” idea.
 
+### Measured current draw (battery terminals)
+
+Average current **probed at the battery terminals** (µA). Values depend on supply voltage, RF environment, and firmware build; treat as reference lab readings.
+
+| Mode | Current (µA) |
+| --- | ---: |
+| Shelf mode (System OFF) | 8.685 |
+| Advertise for gateway app (datetime sync / connectable adv) | 283.493 |
+| Connected to gateway app | 317.861 |
+| Production non-connectable advertise burst | 364.625 |
+| Production passive scan burst | 2893.38 |
+| Production routine (`adv_interval_s` = **1** s, `scan_interval_s` = **20** s) | 467.891 |
+
 ---
 
 ## State Machine Diagram
