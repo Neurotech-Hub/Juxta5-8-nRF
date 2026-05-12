@@ -16,6 +16,7 @@
 
 #define JUXTA_DEFAULT_SCAN_INTERVAL_S 30U
 #define JUXTA_DEFAULT_VITALS_INTERVAL_S 60U
+#define JUXTA_DEFAULT_ADV_INTERVAL_S 10U
 /* Node `upload_path` and NVS field (single hard-coded path until app-driven paths return). */
 #define JUXTA_UPLOAD_PATH_FIXED "/"
 #define JUXTA_DEFAULT_UPLOAD_PATH JUXTA_UPLOAD_PATH_FIXED

@@ -23,11 +23,13 @@ static char boot_device_id[JUXTA_DEVICE_ID_LEN];
 
 static void copy_string(char *dst, size_t dst_size, const char *src)
 {
-	if (dst_size == 0U) {
+	if (dst_size == 0U)
+	{
 		return;
 	}
 
-	if (!src || src[0] == '\0') {
+	if (!src || src[0] == '\0')
+	{
 		dst[0] = '\0';
 		return;
 	}
@@ -39,38 +41,46 @@ void juxta_settings_defaults(struct juxta_settings *settings, const char *device
 {
 	memset(settings, 0, sizeof(*settings));
 	copy_string(settings->subject_id, sizeof(settings->subject_id),
-		    (device_id && device_id[0] != '\0') ? device_id : "JX_000000");
+				(device_id && device_id[0] != '\0') ? device_id : "JX_000000");
 	copy_string(settings->upload_path, sizeof(settings->upload_path), JUXTA_DEFAULT_UPLOAD_PATH);
 	settings->scan_interval_s = JUXTA_DEFAULT_SCAN_INTERVAL_S;
 	settings->vitals_interval_s = JUXTA_DEFAULT_VITALS_INTERVAL_S;
+	settings->adv_interval_s = JUXTA_DEFAULT_ADV_INTERVAL_S;
+	settings->inactivity_doubler = 0U;
 }
 
 static int settings_set(const char *key, size_t len, settings_read_cb read_cb, void *cb_arg)
 {
-	if (strcmp(key, SETTINGS_KEY_CURRENT) == 0) {
-		if (len != sizeof(current_settings)) {
+	if (strcmp(key, SETTINGS_KEY_CURRENT) == 0)
+	{
+		if (len != sizeof(current_settings))
+		{
 			LOG_WRN("Ignoring settings size %zu expected %zu", len, sizeof(current_settings));
 			return -EINVAL;
 		}
 
 		int rc = read_cb(cb_arg, &current_settings, sizeof(current_settings));
-		if (rc >= 0) {
+		if (rc >= 0)
+		{
 			loaded_settings = true;
 			return 0; /* settings_read_cb returns byte count; subsystem expects 0 */
 		}
 		return rc;
 	}
 
-	if (strcmp(key, SETTINGS_KEY_LOG_CACHE) == 0) {
-		if (len != sizeof(current_log_cache)) {
+	if (strcmp(key, SETTINGS_KEY_LOG_CACHE) == 0)
+	{
+		if (len != sizeof(current_log_cache))
+		{
 			LOG_WRN("Ignoring log cache size %zu expected %zu", len, sizeof(current_log_cache));
 			return -EINVAL;
 		}
 
 		int rc = read_cb(cb_arg, &current_log_cache, sizeof(current_log_cache));
 		if (rc >= 0 && current_log_cache.magic == LOG_CACHE_MAGIC &&
-		    current_log_cache.version == LOG_CACHE_VERSION &&
-		    current_log_cache.file_count <= JUXTA_MAX_FILES) {
+			current_log_cache.version == LOG_CACHE_VERSION &&
+			current_log_cache.file_count <= JUXTA_MAX_FILES)
+		{
 			loaded_log_cache = true;
 		}
 		return (rc >= 0) ? 0 : rc;
@@ -87,17 +97,37 @@ static void sanitize_settings(struct juxta_settings *settings)
 	settings->experiment[sizeof(settings->experiment) - 1] = '\0';
 	settings->upload_path[sizeof(settings->upload_path) - 1] = '\0';
 
-	if (settings->subject_id[0] == '\0') {
+	if (settings->subject_id[0] == '\0')
+	{
 		copy_string(settings->subject_id, sizeof(settings->subject_id), boot_device_id);
 	}
 	/* Fixed product policy: always `/` in RAM and on save (Node + NVS). */
 	copy_string(settings->upload_path, sizeof(settings->upload_path), JUXTA_UPLOAD_PATH_FIXED);
-	if (settings->scan_interval_s == 0U) {
+	if (settings->adv_interval_s < 1U || settings->adv_interval_s > 10U)
+	{
+		settings->adv_interval_s = JUXTA_DEFAULT_ADV_INTERVAL_S;
+	}
+	if (settings->scan_interval_s == 0U)
+	{
 		settings->scan_interval_s = JUXTA_DEFAULT_SCAN_INTERVAL_S;
 	}
-	if (settings->vitals_interval_s == 0U) {
+	if (settings->scan_interval_s < 5U)
+	{
+		settings->scan_interval_s = 5U;
+	}
+	else if (settings->scan_interval_s > 60U)
+	{
+		settings->scan_interval_s = 60U;
+	}
+	else
+	{
+		settings->scan_interval_s = (uint16_t)((settings->scan_interval_s / 5U) * 5U);
+	}
+	if (settings->vitals_interval_s == 0U)
+	{
 		settings->vitals_interval_s = JUXTA_DEFAULT_VITALS_INTERVAL_S;
 	}
+	settings->inactivity_doubler = settings->inactivity_doubler ? 1U : 0U;
 }
 
 int juxta_settings_init(const char *device_id)
@@ -105,33 +135,41 @@ int juxta_settings_init(const char *device_id)
 	int rc;
 
 	copy_string(boot_device_id, sizeof(boot_device_id),
-		    (device_id && device_id[0] != '\0') ? device_id : "JX_000000");
+				(device_id && device_id[0] != '\0') ? device_id : "JX_000000");
 	juxta_settings_defaults(&current_settings, boot_device_id);
 
 	rc = settings_subsys_init();
-	if (rc != 0 && rc != -EALREADY) {
+	if (rc != 0 && rc != -EALREADY)
+	{
 		LOG_ERR("settings_subsys_init failed: %d", rc);
 		return rc;
 	}
 
 	rc = settings_load_subtree(SETTINGS_SUBTREE);
-	if (rc != 0) {
+	if (rc != 0)
+	{
 		LOG_WRN("settings_load_subtree failed: %d; using defaults", rc);
 	}
 
-	if (!loaded_settings) {
+	if (!loaded_settings)
+	{
 		LOG_INF("No saved settings; storing defaults");
 		rc = juxta_settings_update(&current_settings);
-		if (rc != 0) {
+		if (rc != 0)
+		{
 			return rc;
 		}
-	} else {
+	}
+	else
+	{
 		sanitize_settings(&current_settings);
 	}
 
-	LOG_INF("settings subject=%s experiment=%s scan=%us vitals=%us",
-		current_settings.subject_id, current_settings.experiment,
-		current_settings.scan_interval_s, current_settings.vitals_interval_s);
+	LOG_INF("settings subject=%s experiment=%s scan=%us adv=%us vitals=%us inactivity_doubler=%u",
+			current_settings.subject_id, current_settings.experiment,
+			current_settings.scan_interval_s, current_settings.adv_interval_s,
+			current_settings.vitals_interval_s,
+			(unsigned int)current_settings.inactivity_doubler);
 	return 0;
 }
 
@@ -145,7 +183,8 @@ int juxta_settings_update(const struct juxta_settings *settings)
 	struct juxta_settings next;
 	int rc;
 
-	if (!settings) {
+	if (!settings)
+	{
 		return -EINVAL;
 	}
 
@@ -153,7 +192,8 @@ int juxta_settings_update(const struct juxta_settings *settings)
 	sanitize_settings(&next);
 
 	rc = settings_save_one(SETTINGS_SUBTREE "/" SETTINGS_KEY_CURRENT, &next, sizeof(next));
-	if (rc != 0) {
+	if (rc != 0)
+	{
 		LOG_ERR("settings_save_one current failed: %d", rc);
 		return rc;
 	}
@@ -165,10 +205,12 @@ int juxta_settings_update(const struct juxta_settings *settings)
 
 int juxta_settings_load_log_cache(struct juxta_log_cache *cache)
 {
-	if (!cache) {
+	if (!cache)
+	{
 		return -EINVAL;
 	}
-	if (!loaded_log_cache) {
+	if (!loaded_log_cache)
+	{
 		return -ENOENT;
 	}
 
@@ -184,7 +226,8 @@ int juxta_settings_save_log_cache(const struct juxta_log_cache *cache)
 	static struct juxta_log_cache next;
 	int rc;
 
-	if (!cache || cache->file_count > JUXTA_MAX_FILES) {
+	if (!cache || cache->file_count > JUXTA_MAX_FILES)
+	{
 		return -EINVAL;
 	}
 
@@ -193,7 +236,8 @@ int juxta_settings_save_log_cache(const struct juxta_log_cache *cache)
 	next.version = LOG_CACHE_VERSION;
 
 	rc = settings_save_one(SETTINGS_SUBTREE "/" SETTINGS_KEY_LOG_CACHE, &next, sizeof(next));
-	if (rc != 0) {
+	if (rc != 0)
+	{
 		LOG_WRN("settings_save_one log cache failed: %d", rc);
 		return rc;
 	}
