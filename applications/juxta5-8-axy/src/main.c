@@ -1,5 +1,6 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/irq.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <hal/nrf_gpio.h>
@@ -88,6 +89,13 @@ int main(void)
 		SAMPLE_PERIOD_MS, MOTION_THRESHOLD_MG);
 
 	while (1) {
+		uint32_t period_motion;
+		unsigned int irq_key = irq_lock();
+
+		period_motion = motion_events;
+		motion_events = 0U;
+		irq_unlock(irq_key);
+
 		int16_t x_mg = 0;
 		int16_t y_mg = 0;
 		int16_t z_mg = 0;
@@ -108,17 +116,14 @@ int main(void)
 		ret |= lis2dh12_zephyr_read_int1_src(&lis2dh12, &int1_src);
 
 		if (ret < 0) {
-			LOG_ERR("Sample read failed (ret=%d)", ret);
+			LOG_ERR("Sample read failed (ret=%d) motion_1s=%u", ret, period_motion);
 		} else {
-			LOG_INF("AXY t=%u seq=%u x_mg=%d y_mg=%d z_mg=%d temp_c=%d mag=%d motion=%u int1=0x%02x",
-				k_uptime_get_32(), sample_seq, x_mg, y_mg, z_mg, temp_c, magnet_state,
-				motion_events, int1_src);
+			LOG_INF("AXY t=%u seq=%u motion_1s=%u x_mg=%d y_mg=%d z_mg=%d temp_c=%d mag=%d int1=0x%02x",
+				k_uptime_get_32(), sample_seq, period_motion, x_mg, y_mg, z_mg, temp_c,
+				magnet_state, int1_src);
 		}
 
-		if (motion_events > 0U) {
-			LOG_INF("AXY motion_event count=%u int1=0x%02x x=%d y=%d z=%d",
-				motion_events, int1_src, x_mg, y_mg, z_mg);
-			motion_events = 0U;
+		if (period_motion > 0U) {
 			(void)gpio_pin_set_dt(&led, 1);
 			k_sleep(K_MSEC(50));
 			(void)gpio_pin_set_dt(&led, 0);
