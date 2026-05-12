@@ -196,7 +196,7 @@ int lis2dh12_zephyr_config_motion(struct lis2dh12_dev *dev, uint8_t threshold, u
 	uint8_t ctrl2 = 0x09;   /* HP filter on INT1 */
 	uint8_t ctrl3 = 0x40;   /* route activity interrupt to INT1 */
 	uint8_t ctrl4 = 0x00;   /* +-2g */
-	uint8_t ctrl5 = 0x08;   /* latch INT1 */
+	uint8_t ctrl5 = 0x00;   /* non-latched INT1 */
 	uint8_t int1_cfg = 0x2A;/* XH/YH/ZH OR */
 	uint8_t reference = 0;
 	uint8_t int1_src = 0;

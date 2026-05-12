@@ -740,7 +740,7 @@ int juxta_log_append_event(struct juxta_log_context *ctx, const struct juxta_set
 	return append_row(ctx, JUXTA_LOG_JXS, row);
 }
 
-int juxta_log_append_vitals(struct juxta_log_context *ctx, uint32_t unix_time, uint8_t motion,
+int juxta_log_append_vitals(struct juxta_log_context *ctx, uint32_t unix_time, uint16_t motion,
 							int32_t batt_mv, int8_t temp_c)
 {
 	static char row[96];

@@ -30,6 +30,7 @@
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/watchdog.h>
+#include <zephyr/irq.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/mgmt/mcumgr/transport/smp_bt.h>
@@ -484,9 +485,14 @@ static void vitals_work_handler(struct k_work *work)
 	/* Motion counts LIS2DH12 events since the last vitals run (typically
 	 * vitals_interval_s, often 60 s). Used with inactivity_doubler to stretch
 	 * the BLE scan cadence when there was no activity in that window. */
-	uint8_t motion = (uint8_t)MIN(motion_events, 255U);
+	unsigned int key = irq_lock();
+	uint32_t raw_motion = motion_events;
 
-	motion_events = 0;
+	motion_events = 0U;
+	irq_unlock(key);
+
+	uint16_t motion = (uint16_t)MIN(raw_motion, 65535U);
+
 	last_vitals_period_zero_motion = (motion == 0U);
 	k_work_submit(&state_work);
 

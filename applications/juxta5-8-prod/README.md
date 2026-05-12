@@ -67,6 +67,15 @@ After **production init** (`hardware_ready`), the device never runs **non-connec
 | **Passive scanning**                             | `start_scanning()` — stops any adv first, 100 ms gap, then `bt_le_scan_start` | `SCAN_BURST_MS` (**3000 ms**) | Listen for peer `JX_…` names; queue events for **JXB** logging after the burst                                                                                                |
 | **Connectable “gateway” advertising** (optional) | `start_connectable_adv()` (Hublink, full GATT)                                | `GATEWAY_ADV_MS` (**30 s**)   | When `JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` is **1**: after a **`JXGA_`** name is overheard in scan, open a connectable window for an iOS gateway. **Default build: disabled.** |
 
+**Non-connectable advertising burst details** (see `start_nonconn_adv()` and `ADV_BURST_MS` in [`src/main.c`](src/main.c)):
+
+| Parameter | Value | Notes |
+| --- | --- | --- |
+| Burst wall time | **500 ms** | `ADV_BURST_MS`; `state_timer` stops non-connectable advertising after this window, then returns to **IDLE**. |
+| Cadence between bursts | **`adv_interval_s`** (NVS / Gateway) | Clamped **1–10** s; compared against `last_adv_ts` in whole seconds (`juxta_time_now()`). Scan vs adv scheduling and jitter still apply as in the paragraph below. |
+| BLE advertising event spacing (inside the burst) | **100–150 ms** | `interval_min` / `interval_max` = `BT_GAP_ADV_FAST_INT_MIN_2` / `BT_GAP_ADV_FAST_INT_MAX_2` (Zephyr `gap.h`: **0x00A0** / **0x00F0** in 0.625 ms units → **100 ms** / **150 ms** nominal). |
+| AD payload | `BT_DATA_NAME_COMPLETE` | Local name `JX_…` (`adv_name`); non-connectable, identity-only burst for peer discovery. |
+
 **When both “due”, scan wins.** After going IDLE, the handler evaluates **`scan_due`** (`juxta_time_now()` ≥ `last_scan_ts` + effective **`scan_interval_s`** from NVS / Gateway), then **`adv_due`** (≥ `last_adv_ts` + **`adv_interval_s`** from NVS / Gateway, clamped **1–10** s). If `JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` is enabled, **`do_gateway_adv`** (set when a scanned name begins with **`JXGA_`**) is evaluated **before** `scan_due` / `adv_due`. If nothing applies, it programs the timer for the **earlier** of the next scan vs adv deadline, plus a small **random jitter** (0–999 ms) to desynchronize colliding devices.
 
 **Timing note:** `scan_due` / `adv_due` are driven by **`juxta_time_now()` in whole seconds**, so **`ADV_BURST_MS` (500) and `SCAN_BURST_MS` (3000) are not a harmful “divisor” relationship** for the state machine—bursts are sequential one-shots. **Idle-period jitter** (0–999 ms on the next sleep) is what spreads out **peer** wakeups when many devices use similar `scan_interval_s` / `adv_interval_s`; it does not randomize burst lengths. Repeated **ties** on the same second are more likely when `scan_interval_s` is a multiple of **`adv_interval_s`** than from 3000 being 6×500.

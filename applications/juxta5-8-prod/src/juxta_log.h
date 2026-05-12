@@ -40,7 +40,7 @@ int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *s
 int juxta_log_format(struct juxta_log_context *ctx);
 int juxta_log_append_event(struct juxta_log_context *ctx, const struct juxta_settings *settings,
 						   const char *device_id, const char *event, uint32_t unix_time);
-int juxta_log_append_vitals(struct juxta_log_context *ctx, uint32_t unix_time, uint8_t motion,
+int juxta_log_append_vitals(struct juxta_log_context *ctx, uint32_t unix_time, uint16_t motion,
 							int32_t batt_mv, int8_t temp_c);
 int juxta_log_append_ble_observation(struct juxta_log_context *ctx, uint32_t unix_time,
 									 const char *observer_id, const char *peer_id, int8_t rssi);
