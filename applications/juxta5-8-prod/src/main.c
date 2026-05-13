@@ -946,20 +946,35 @@ static uint32_t last_adv_ts;
 static uint32_t last_scan_ts;
 static struct k_timer state_timer;
 
-/* Non-connectable advertising interval comes from NVS (`adv_interval_s`),
- * clamped to 1–10 s in `juxta_settings` sanitization. */
+/* Non-connectable advertising cadence from NVS (`adv_interval_s`):
+ * **0** = disabled; otherwise **1**–**JUXTA_MAX_BLE_INTERVAL_S** s (`juxta_settings`). */
 static uint32_t get_adv_interval_s(void)
 {
 	return (uint32_t)juxta_settings_get()->adv_interval_s;
 }
 
-/* Effective scan period: base from NVS, or 2× base (max 60 s) when
+static bool adv_interval_enabled(void)
+{
+	return juxta_settings_get()->adv_interval_s != 0U;
+}
+
+static bool scan_interval_enabled(void)
+{
+	return juxta_settings_get()->scan_interval_s != 0U;
+}
+
+/* Effective scan period: base from NVS, or 2× base (capped at JUXTA_MAX_BLE_INTERVAL_S) when
  * inactivity_doubler is on and the last vitals window had zero motion.
- * Base is already clamped to 5–60 s in steps of 5 in juxta_settings. */
+ * Base **0** disables scan bursts; otherwise **1**–**JUXTA_MAX_BLE_INTERVAL_S** from `juxta_settings`. */
 static uint32_t get_effective_scan_interval_s(void)
 {
 	const struct juxta_settings *s = juxta_settings_get();
 	uint32_t base = (uint32_t)s->scan_interval_s;
+
+	if (base == 0U)
+	{
+		return 0U;
+	}
 
 	if (s->inactivity_doubler == 0U || !last_vitals_period_zero_motion)
 	{
@@ -968,9 +983,9 @@ static uint32_t get_effective_scan_interval_s(void)
 
 	uint32_t doubled = base * 2U;
 
-	if (doubled > 60U)
+	if (doubled > JUXTA_MAX_BLE_INTERVAL_S)
 	{
-		doubled = 60U;
+		doubled = JUXTA_MAX_BLE_INTERVAL_S;
 	}
 	return doubled;
 }
@@ -1063,8 +1078,10 @@ static void state_work_handler(struct k_work *work)
 	}
 #endif
 
-	bool scan_due = interval_elapsed(now, last_scan_ts, get_effective_scan_interval_s());
-	bool adv_due = interval_elapsed(now, last_adv_ts, get_adv_interval_s());
+	bool scan_due = scan_interval_enabled() &&
+					interval_elapsed(now, last_scan_ts, get_effective_scan_interval_s());
+	bool adv_due =
+		adv_interval_enabled() && interval_elapsed(now, last_adv_ts, get_adv_interval_s());
 
 	if (scan_due)
 	{
@@ -1087,8 +1104,18 @@ static void state_work_handler(struct k_work *work)
 		}
 	}
 
-	uint32_t wait_adv = seconds_until(now, last_adv_ts, get_adv_interval_s());
-	uint32_t wait_scan = seconds_until(now, last_scan_ts, get_effective_scan_interval_s());
+	uint32_t wait_adv =
+		adv_interval_enabled() ? seconds_until(now, last_adv_ts, get_adv_interval_s()) : UINT32_MAX;
+	uint32_t wait_scan = scan_interval_enabled()
+							 ? seconds_until(now, last_scan_ts, get_effective_scan_interval_s())
+							 : UINT32_MAX;
+
+	if (wait_adv == UINT32_MAX && wait_scan == UINT32_MAX)
+	{
+		k_timer_stop(&state_timer);
+		return;
+	}
+
 	uint32_t next_s = MIN(wait_adv, wait_scan);
 	uint32_t jitter_ms = sys_rand32_get() % 1000U;
 	/* Cap so next_s * 1000 + jitter never overflows uint32 and K_MSEC stays sane. */

@@ -84,7 +84,7 @@ Bring-up and feature work are intentionally split into separate apps so each sub
 ### `applications/juxta5-8-ble-test` (Implemented)
 - **Purpose**: BLE bring-up plus power-characterization helpers: LED control, one-shot battery read, and magnet-wake deep sleep emulation.
 - **Behavior**:
-  - Advertises as **`Juxta5-8-BLE`** (connectable, fast interval). **TX power** defaults to **+8 dBm** at the radio (`CONFIG_BT_CTLR_TX_PWR_ANTENNA`), the maximum supported by the nRF52840 SoC; the controller rounds to the nearest legal level. Net power at the **antenna** depends on matching and layout—this is not a regulatory certification setting.
+  - Advertises as **`Juxta5-8-BLE`** (connectable, fast interval). **TX power** is **+8 dBm** at the radio via **`CONFIG_BT_CTLR_TX_PWR_ANTENNA`** in the board defconfig [`boards/NeurotechHub/Juxta5-8_nRF52840/Juxta5-8_nRF52840_defconfig`](boards/NeurotechHub/Juxta5-8_nRF52840/Juxta5-8_nRF52840_defconfig) (SoftDevice Controller; nearest legal level if HW differs). Net power at the **antenna** depends on matching and layout—this is not a regulatory certification setting.
   - **Re-advertises** after disconnect unless a **deep sleep** sequence has started (advertising restart is queued from the system workqueue when appropriate).
   - Single custom **128-bit service** `ad2a98a4-2148-4b58-9e14-7e2cbb6c7a01`:
     - **LED** `…7a02`: read + write (+ write-no-rsp); **1 byte** — `0` = LED off, non-zero = on (`DT_ALIAS(led0)`).
@@ -92,7 +92,7 @@ Bring-up and feature work are intentionally split into separate apps so each sub
     - **Deep sleep** `…7a04`: **write only** (+ write-no-rsp). **`0x01`** begins the sleep sequence (**magnet away** ⇒ pad **high**/GPIO **inactive**, same **`gpio_pin_get_dt(magnet_sensor) == 0`** as blink inactive — magnet present ⇒ **abort**). Runs on a work queue: **`bt_le_adv_stop()`**, **`bt_conn_disconnect`** (reason **Remote Power Off**), brief delay, **`bt_disable()`**, `MAG_INT` **`GPIO_INPUT` + `GPIO_INT_LEVEL_LOW`** (wake when the pad goes **electrically LOW**, i.e. **magnet present**), **`sys_poweroff()`**. **`0x00` or other values** write successfully but **do nothing**. Wake causes a **cold boot** — pair/scan BLE again afterward.
   - **SAADC analog front-end**: `CONFIG_PM_DEVICE_RUNTIME` + Nordic SAADC driver turn the converter **on only around each `adc_read`** issued from the battery characteristic (minimal steady-state analog draw between reads—oversampling bursts still consume energy briefly per read).
   - RTT logs Bluetooth lifecycle, LED writes, battery sample failures, and deep-sleep sequencing.
-- **Dependencies**: BLE peripheral, GPIO, SAADC/`zephyr,user` fuel channel (see DTS), **`sys_poweroff`** (`CONFIG_POWEROFF=y`), RTT (`CONFIG_PM_DEVICE_RUNTIME` enabled for SAADC idle). Assumes **SoftDevice Controller** for `CONFIG_BT_CTLR_TX_PWR_ANTENNA`.
+- **Dependencies**: BLE peripheral, GPIO, SAADC/`zephyr,user` fuel channel (see DTS), **`sys_poweroff`** (`CONFIG_POWEROFF=y`), RTT (`CONFIG_PM_DEVICE_RUNTIME` enabled for SAADC idle). Assumes **SoftDevice Controller**; **TX power** (+8 dBm) is set in the **Juxta5-8_nRF52840** board defconfig when `CONFIG_BT` is enabled.
 - **Reference links**:
   - [`Reference/nRF/applications/juxta-ble`](Reference/nRF/applications/juxta-ble)
   - [`Reference/nRF/samples/ble/peripheral`](Reference/nRF/samples/ble/peripheral)

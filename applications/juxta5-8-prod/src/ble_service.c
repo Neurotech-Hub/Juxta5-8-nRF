@@ -510,23 +510,25 @@ static int apply_gateway_command(const char *json)
 		juxta_ble_reset_requested(); /* does not return */
 	}
 
-	if (gateway_u32(json, "scan_interval", "scanInterval", &value) == 0 && value > 0U &&
-		value <= UINT16_MAX)
+	if (gateway_u32(json, "scan_interval", "scanInterval", &value) == 0 && value <= UINT16_MAX)
 	{
+		if (value > JUXTA_MAX_BLE_INTERVAL_S)
+		{
+			LOG_WRN("gateway scan_interval=%u clamped to %u", value, JUXTA_MAX_BLE_INTERVAL_S);
+			value = JUXTA_MAX_BLE_INTERVAL_S;
+		}
 		next.scan_interval_s = (uint16_t)value;
 		changed = true;
 	}
-	if (gateway_u32(json, "adv_interval", "advInterval", &value) == 0)
+	if (gateway_u32(json, "adv_interval", "advInterval", &value) == 0 && value <= UINT16_MAX)
 	{
-		if (value >= 1U && value <= 10U)
+		if (value > JUXTA_MAX_BLE_INTERVAL_S)
 		{
-			next.adv_interval_s = (uint16_t)value;
-			changed = true;
+			LOG_WRN("gateway adv_interval=%u clamped to %u", value, JUXTA_MAX_BLE_INTERVAL_S);
+			value = JUXTA_MAX_BLE_INTERVAL_S;
 		}
-		else
-		{
-			LOG_WRN("gateway adv_interval=%u ignored (use 1–10)", value);
-		}
+		next.adv_interval_s = (uint16_t)value;
+		changed = true;
 	}
 
 	bool inact = false;

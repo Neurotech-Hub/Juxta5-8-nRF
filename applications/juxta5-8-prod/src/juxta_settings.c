@@ -103,25 +103,15 @@ static void sanitize_settings(struct juxta_settings *settings)
 	}
 	/* Fixed product policy: always `/` in RAM and on save (Node + NVS). */
 	copy_string(settings->upload_path, sizeof(settings->upload_path), JUXTA_UPLOAD_PATH_FIXED);
-	if (settings->adv_interval_s < 1U || settings->adv_interval_s > 10U)
+	/* 0 = disable non-connectable advertising; otherwise 1..JUXTA_MAX_BLE_INTERVAL_S (any integer). */
+	if (settings->adv_interval_s > JUXTA_MAX_BLE_INTERVAL_S)
 	{
-		settings->adv_interval_s = JUXTA_DEFAULT_ADV_INTERVAL_S;
+		settings->adv_interval_s = JUXTA_MAX_BLE_INTERVAL_S;
 	}
-	if (settings->scan_interval_s == 0U)
+	/* 0 = disable passive scan bursts; otherwise 1..JUXTA_MAX_BLE_INTERVAL_S (any integer). */
+	if (settings->scan_interval_s > JUXTA_MAX_BLE_INTERVAL_S)
 	{
-		settings->scan_interval_s = JUXTA_DEFAULT_SCAN_INTERVAL_S;
-	}
-	if (settings->scan_interval_s < 5U)
-	{
-		settings->scan_interval_s = 5U;
-	}
-	else if (settings->scan_interval_s > 60U)
-	{
-		settings->scan_interval_s = 60U;
-	}
-	else
-	{
-		settings->scan_interval_s = (uint16_t)((settings->scan_interval_s / 5U) * 5U);
+		settings->scan_interval_s = JUXTA_MAX_BLE_INTERVAL_S;
 	}
 	if (settings->vitals_interval_s == 0U)
 	{
