@@ -16,11 +16,15 @@
 
 #define JUXTA_DEFAULT_SCAN_INTERVAL_S 30U
 #define JUXTA_DEFAULT_VITALS_INTERVAL_S 60U
-#define JUXTA_DEFAULT_ADV_INTERVAL_S 10U
+#define JUXTA_DEFAULT_ADV_INTERVAL_S 5U
 /* Non-connectable adv cadence and passive scan burst cadence (seconds), NVS + Gateway.
  * Whole-second integers 0 through JUXTA_MAX_BLE_INTERVAL_S inclusive (0 = that modality off).
  * No stepping; values above the max are clamped on save. */
 #define JUXTA_MAX_BLE_INTERVAL_S 120U
+/* After a vitals window with zero LIS2DH12 motion, passive scan cadence uses
+ * scan_interval_s × inactivity_multiplier (capped at JUXTA_MAX_BLE_INTERVAL_S). */
+#define JUXTA_DEFAULT_INACTIVITY_MULTIPLIER 1U
+#define JUXTA_MAX_INACTIVITY_MULTIPLIER 10U
 /* Node `upload_path` and NVS field (single hard-coded path until app-driven paths return). */
 #define JUXTA_UPLOAD_PATH_FIXED "/"
 #define JUXTA_DEFAULT_UPLOAD_PATH JUXTA_UPLOAD_PATH_FIXED

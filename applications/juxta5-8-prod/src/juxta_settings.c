@@ -46,7 +46,7 @@ void juxta_settings_defaults(struct juxta_settings *settings, const char *device
 	settings->scan_interval_s = JUXTA_DEFAULT_SCAN_INTERVAL_S;
 	settings->vitals_interval_s = JUXTA_DEFAULT_VITALS_INTERVAL_S;
 	settings->adv_interval_s = JUXTA_DEFAULT_ADV_INTERVAL_S;
-	settings->inactivity_doubler = 0U;
+	settings->inactivity_multiplier = JUXTA_DEFAULT_INACTIVITY_MULTIPLIER;
 }
 
 static int settings_set(const char *key, size_t len, settings_read_cb read_cb, void *cb_arg)
@@ -117,7 +117,18 @@ static void sanitize_settings(struct juxta_settings *settings)
 	{
 		settings->vitals_interval_s = JUXTA_DEFAULT_VITALS_INTERVAL_S;
 	}
-	settings->inactivity_doubler = settings->inactivity_doubler ? 1U : 0U;
+	if (settings->inactivity_multiplier == 0U ||
+	    settings->inactivity_multiplier > JUXTA_MAX_INACTIVITY_MULTIPLIER)
+	{
+		if (settings->inactivity_multiplier > JUXTA_MAX_INACTIVITY_MULTIPLIER)
+		{
+			settings->inactivity_multiplier = JUXTA_MAX_INACTIVITY_MULTIPLIER;
+		}
+		else
+		{
+			settings->inactivity_multiplier = JUXTA_DEFAULT_INACTIVITY_MULTIPLIER;
+		}
+	}
 }
 
 int juxta_settings_init(const char *device_id)
@@ -155,11 +166,11 @@ int juxta_settings_init(const char *device_id)
 		sanitize_settings(&current_settings);
 	}
 
-	LOG_INF("settings subject=%s experiment=%s scan=%us adv=%us vitals=%us inactivity_doubler=%u",
+	LOG_INF("settings subject=%s experiment=%s scan=%us adv=%us vitals=%us inactivity_multiplier=%u",
 			current_settings.subject_id, current_settings.experiment,
 			current_settings.scan_interval_s, current_settings.adv_interval_s,
 			current_settings.vitals_interval_s,
-			(unsigned int)current_settings.inactivity_doubler);
+			(unsigned int)current_settings.inactivity_multiplier);
 	return 0;
 }
 

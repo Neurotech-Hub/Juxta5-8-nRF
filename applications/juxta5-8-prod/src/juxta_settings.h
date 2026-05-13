@@ -13,7 +13,7 @@ struct juxta_settings
 	char experiment[JUXTA_EXPERIMENT_LEN];
 	/* Same 16-byte footprint as legacy `settings_reserved[JUXTA_MODE_LEN]`. */
 	uint16_t adv_interval_s;   /* 0–JUXTA_MAX_BLE_INTERVAL_S; 0 = no periodic non-conn adv */
-	uint8_t inactivity_doubler;
+	uint8_t inactivity_multiplier; /* 1–JUXTA_MAX_INACTIVITY_MULTIPLIER; scan interval only */
 	uint8_t settings_reserved[JUXTA_MODE_LEN - 3U];
 	char upload_path[JUXTA_UPLOAD_PATH_LEN];
 	uint16_t scan_interval_s; /* 0–JUXTA_MAX_BLE_INTERVAL_S; 0 = no periodic passive scan */

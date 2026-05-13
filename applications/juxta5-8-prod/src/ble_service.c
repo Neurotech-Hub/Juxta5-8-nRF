@@ -233,20 +233,6 @@ static int gateway_string(const char *json, const char *snake_key, const char *l
 	return -ENOENT;
 }
 
-static int gateway_bool_value(const char *json, const char *snake_key, const char *legacy_key,
-							  bool *out)
-{
-	if (extract_bool_value(json, snake_key, out) == 0)
-	{
-		return 0;
-	}
-	if (legacy_key)
-	{
-		return extract_bool_value(json, legacy_key, out);
-	}
-	return -ENOENT;
-}
-
 static int generate_node_response(char *buffer, size_t buffer_size)
 {
 	char device_id[JUXTA_DEVICE_ID_LEN];
@@ -274,11 +260,11 @@ static int generate_node_response(char *buffer, size_t buffer_size)
 						   "\"experiment\":\"%s\","
 						   "\"adv_interval\":%u,"
 						   "\"scan_interval\":%u,"
-						   "\"inactivity_doubler\":%s}",
+						   "\"inactivity_multiplier\":%u}",
 						   JUXTA_FIRMWARE_VERSION, battery_level, memory_level, device_id,
 						   settings->subject_id, settings->experiment, settings->adv_interval_s,
 						   settings->scan_interval_s,
-						   settings->inactivity_doubler ? "true" : "false");
+						   (unsigned int)settings->inactivity_multiplier);
 
 	if (written < 0 || written >= (int)buffer_size)
 	{
@@ -531,10 +517,21 @@ static int apply_gateway_command(const char *json)
 		changed = true;
 	}
 
-	bool inact = false;
-	if (gateway_bool_value(json, "inactivity_doubler", "inactivityDoubler", &inact) == 0)
+	if (gateway_u32(json, "inactivity_multiplier", "inactivityMultiplier", &value) == 0)
 	{
-		next.inactivity_doubler = inact ? 1U : 0U;
+		if (value < JUXTA_DEFAULT_INACTIVITY_MULTIPLIER)
+		{
+			LOG_WRN("gateway inactivity_multiplier=%u clamped to %u", value,
+				JUXTA_DEFAULT_INACTIVITY_MULTIPLIER);
+			value = JUXTA_DEFAULT_INACTIVITY_MULTIPLIER;
+		}
+		else if (value > JUXTA_MAX_INACTIVITY_MULTIPLIER)
+		{
+			LOG_WRN("gateway inactivity_multiplier=%u clamped to %u", value,
+				JUXTA_MAX_INACTIVITY_MULTIPLIER);
+			value = JUXTA_MAX_INACTIVITY_MULTIPLIER;
+		}
+		next.inactivity_multiplier = (uint8_t)value;
 		changed = true;
 	}
 	if (gateway_u32(json, "vitals_interval", "vitalsInterval", &value) == 0 && value > 0U &&
@@ -563,10 +560,10 @@ static int apply_gateway_command(const char *json)
 		}
 		const struct juxta_settings *a = juxta_settings_get();
 
-		LOG_INF("gateway settings saved: scan=%u adv=%u vitals=%u inactivity_doubler=%u "
+		LOG_INF("gateway settings saved: scan=%u adv=%u vitals=%u inactivity_multiplier=%u "
 				"subject=\"%s\" experiment=\"%s\"",
 				a->scan_interval_s, a->adv_interval_s, a->vitals_interval_s,
-				(unsigned int)a->inactivity_doubler, a->subject_id, a->experiment);
+				(unsigned int)a->inactivity_multiplier, a->subject_id, a->experiment);
 		if (production_ready)
 		{
 			(void)juxta_log_append_event(log_ctx, a, device_id, "settings_changed",

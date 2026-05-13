@@ -73,6 +73,10 @@ static const struct adc_dt_spec fuel = ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
 #define BATT_BROWNOUT_MV 2900U /* Below this: immediate shelf mode */
 #define BATT_DFU_MIN_MV 3200U  /* Below this: DFU access denied   */
 
+/* LIS2DH12 motion interrupt — `lis2dh12_zephyr_config_motion()` (INT1_THS / INT1_DURATION). */
+#define LIS2DH12_MOTION_THRESHOLD_MG 16U
+#define LIS2DH12_MOTION_DURATION_SAMPLES 0U
+
 /* ---------------------------------------------------------------------------
  * LED mode state machine
  *
@@ -441,7 +445,8 @@ static int init_accel(void)
 		return rc;
 	}
 	accel_ready = true;
-	rc = lis2dh12_zephyr_config_motion(&lis2dh12, 10U, 0U);
+	rc = lis2dh12_zephyr_config_motion(&lis2dh12, LIS2DH12_MOTION_THRESHOLD_MG,
+									   LIS2DH12_MOTION_DURATION_SAMPLES);
 	if (rc != 0)
 	{
 		return rc;
@@ -505,7 +510,7 @@ static void vitals_work_handler(struct k_work *work)
 	}
 
 	/* Motion counts LIS2DH12 events since the last vitals run (typically
-	 * vitals_interval_s, often 60 s). Used with inactivity_doubler to stretch
+	 * vitals_interval_s, often 60 s). Used with inactivity_multiplier to stretch
 	 * the BLE scan cadence when there was no activity in that window. */
 	unsigned int key = irq_lock();
 	uint32_t raw_motion = motion_events;
@@ -963,9 +968,9 @@ static bool scan_interval_enabled(void)
 	return juxta_settings_get()->scan_interval_s != 0U;
 }
 
-/* Effective scan period: base from NVS, or 2× base (capped at JUXTA_MAX_BLE_INTERVAL_S) when
- * inactivity_doubler is on and the last vitals window had zero motion.
- * Base **0** disables scan bursts; otherwise **1**–**JUXTA_MAX_BLE_INTERVAL_S** from `juxta_settings`. */
+/* Effective scan period: base from NVS, or base × inactivity_multiplier (capped at
+ * JUXTA_MAX_BLE_INTERVAL_S) when multiplier > 1 and the last vitals window had zero motion.
+ * Advertising cadence is unchanged. Base **0** disables scan bursts. */
 static uint32_t get_effective_scan_interval_s(void)
 {
 	const struct juxta_settings *s = juxta_settings_get();
@@ -976,18 +981,18 @@ static uint32_t get_effective_scan_interval_s(void)
 		return 0U;
 	}
 
-	if (s->inactivity_doubler == 0U || !last_vitals_period_zero_motion)
+	if (s->inactivity_multiplier <= 1U || !last_vitals_period_zero_motion)
 	{
 		return base;
 	}
 
-	uint32_t doubled = base * 2U;
+	uint32_t scaled = base * (uint32_t)s->inactivity_multiplier;
 
-	if (doubled > JUXTA_MAX_BLE_INTERVAL_S)
+	if (scaled > JUXTA_MAX_BLE_INTERVAL_S)
 	{
-		doubled = JUXTA_MAX_BLE_INTERVAL_S;
+		scaled = JUXTA_MAX_BLE_INTERVAL_S;
 	}
-	return doubled;
+	return scaled;
 }
 
 /* uint64 deadlines avoid uint32 wrap in (last + interval) vs now. */
