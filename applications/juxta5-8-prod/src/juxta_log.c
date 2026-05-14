@@ -421,6 +421,51 @@ int juxta_log_recover_files(struct juxta_log_context *ctx)
 	return 0;
 }
 
+/* After a new JXV pseudo-file is created, record NVS settings so each daily file is
+ * self-contained (no need to correlate with old JXS for subject/intervals). */
+static int append_jxv_settings_snapshot(struct juxta_log_context *ctx,
+					const struct juxta_settings *settings)
+{
+	struct juxta_file_entry *entry;
+	static char block[JUXTA_SUBJECT_ID_LEN + JUXTA_EXPERIMENT_LEN + 120];
+	int len;
+	int rc;
+
+	if (!ctx || !settings || ctx->active_jxv == UINT32_MAX || ctx->active_jxv >= ctx->file_count)
+	{
+		return -EINVAL;
+	}
+
+	entry = &ctx->files[ctx->active_jxv];
+	if (entry->type != JUXTA_LOG_JXV)
+	{
+		return -EINVAL;
+	}
+
+	len = snprintf(block, sizeof(block),
+		       "#device_settings,subject_id,experiment,scan_interval_s,adv_interval_s,"
+		       "vitals_interval_s,inactivity_multiplier\n"
+		       "#device_settings,%s,%s,%u,%u,%u,%u\n",
+		       settings->subject_id, settings->experiment,
+		       (unsigned)settings->scan_interval_s, (unsigned)settings->adv_interval_s,
+		       (unsigned)settings->vitals_interval_s,
+		       (unsigned)settings->inactivity_multiplier);
+	if (len < 0 || len >= (int)sizeof(block))
+	{
+		return -ENOSPC;
+	}
+
+	rc = flash_append(ctx, entry->offset + entry->length, block, (size_t)len);
+
+	if (rc != 0)
+	{
+		return rc;
+	}
+
+	entry->length += (uint32_t)len;
+	return 0;
+}
+
 static int ensure_file(struct juxta_log_context *ctx, enum juxta_log_type type,
 					   const struct juxta_settings *settings, uint32_t unix_time)
 {
@@ -495,6 +540,15 @@ static int ensure_file(struct juxta_log_context *ctx, enum juxta_log_type type,
 	if (rc != 0)
 	{
 		return rc;
+	}
+
+	if (type == JUXTA_LOG_JXV)
+	{
+		rc = append_jxv_settings_snapshot(ctx, settings);
+		if (rc != 0)
+		{
+			return rc;
+		}
 	}
 
 	struct juxta_log_cache cache;

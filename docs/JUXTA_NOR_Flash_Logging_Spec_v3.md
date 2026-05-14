@@ -76,10 +76,14 @@ Example physical flash contents:
 ```text
 JXV20260507.csv
 unix,motion,batt_v,temp_c
+#device_settings,subject_id,experiment,scan_interval_s,adv_interval_s,vitals_interval_s,inactivity_multiplier
+#device_settings,JX_9B10A1,,30,5,60,1
 1715200000,12,3.81,24
 1715200060,14,3.80,24
 #EOF
 ```
+
+**Juxta5-8 production** opens each new JXV with the same two `#device_settings` lines (NVS snapshot at file creation) after the schema row so downstream tools do not need older JXS files for subject and interval context.
 
 ---
 
@@ -102,6 +106,8 @@ JXV20260507.csv
 ```csv
 unix,motion,batt_v,temp_c
 ```
+
+Optional **leading metadata** (same production behaviour as in the physical layout example above): two lines beginning with `#device_settings` repeat the column names then the current NVS values (`subject_id`, `experiment`, `scan_interval_s`, `adv_interval_s`, `vitals_interval_s`, `inactivity_multiplier`) when the vitals file was created.
 
 ## Example Rows
 
