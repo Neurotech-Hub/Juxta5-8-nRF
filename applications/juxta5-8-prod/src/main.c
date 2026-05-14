@@ -69,8 +69,10 @@ static const struct gpio_dt_spec accel_int = GPIO_DT_SPEC_GET(ACCEL_INT_NODE, gp
 #define FUEL_DIV_DEN 100L
 static const struct adc_dt_spec fuel = ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
 
-/* Battery voltage safeguards (applied at boot and in vitals timer). */
-#define BATT_BROWNOUT_MV 2900U /* Below this: immediate shelf mode */
+/* Battery voltage safeguards (applied at boot and in vitals timer).
+ * Brownout threshold matches ~2.75 V pack after divider calibration (typical
+ * LiPo tail); shelf below this to limit deep discharge. */
+#define BATT_BROWNOUT_MV 2750U /* Below this: immediate shelf mode */
 #define BATT_DFU_MIN_MV 3200U  /* Below this: DFU access denied   */
 
 /* LIS2DH12 motion interrupt — `lis2dh12_zephyr_config_motion()` (INT1_THS / INT1_DURATION). */
@@ -942,7 +944,7 @@ static void process_scan_events(void)
  * Operational state machine
  * -------------------------------------------------------------------------*/
 #define ADV_BURST_MS 500U
-#define SCAN_BURST_MS 3000U
+#define SCAN_BURST_MS 1000U /* Passive scan burst wall time (state_timer) */
 #if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
 #define GATEWAY_ADV_MS 30000U
 #endif

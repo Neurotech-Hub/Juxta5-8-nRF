@@ -160,79 +160,6 @@ static bool extract_bool_true(const char *json, const char *key)
 				 strstr(p, " true") == p + strlen(pattern));
 }
 
-static int extract_bool_value(const char *json, const char *key, bool *out)
-{
-	char pattern[48];
-	const char *p;
-
-	(void)snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-	p = strstr(json, pattern);
-	if (!p)
-	{
-		return -ENOENT;
-	}
-
-	p += strlen(pattern);
-	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-	{
-		p++;
-	}
-	if (strncmp(p, "true", 4) == 0)
-	{
-		*out = true;
-		return 0;
-	}
-	if (strncmp(p, "false", 5) == 0)
-	{
-		*out = false;
-		return 0;
-	}
-	return -EINVAL;
-}
-
-static bool gateway_flag_true(const char *json, const char *snake_key, const char *legacy_key)
-{
-	bool v = false;
-
-	if (extract_bool_value(json, snake_key, &v) == 0 && v)
-	{
-		return true;
-	}
-	if (legacy_key && extract_bool_value(json, legacy_key, &v) == 0 && v)
-	{
-		return true;
-	}
-	return extract_bool_true(json, snake_key) || (legacy_key && extract_bool_true(json, legacy_key));
-}
-
-static int gateway_u32(const char *json, const char *snake_key, const char *legacy_key,
-					   uint32_t *value)
-{
-	if (extract_u32(json, snake_key, value) == 0)
-	{
-		return 0;
-	}
-	if (legacy_key && extract_u32(json, legacy_key, value) == 0)
-	{
-		return 0;
-	}
-	return -ENOENT;
-}
-
-static int gateway_string(const char *json, const char *snake_key, const char *legacy_key,
-						  char *out, size_t out_size)
-{
-	if (extract_string(json, snake_key, out, out_size) == 0)
-	{
-		return 0;
-	}
-	if (legacy_key)
-	{
-		return extract_string(json, legacy_key, out, out_size);
-	}
-	return -ENOENT;
-}
-
 static int generate_node_response(char *buffer, size_t buffer_size)
 {
 	char device_id[JUXTA_DEVICE_ID_LEN];
@@ -252,15 +179,15 @@ static int generate_node_response(char *buffer, size_t buffer_size)
 	}
 
 	int written = snprintf(buffer, buffer_size,
-						   "{\"firmware_version\":\"%s\","
-						   "\"battery_level\":%u,"
-						   "\"memory_level\":%u,"
-						   "\"device_id\":\"%s\","
-						   "\"subject_id\":\"%s\","
+						   "{\"firmwareVersion\":\"%s\","
+						   "\"batteryLevel\":%u,"
+						   "\"memoryLevel\":%u,"
+						   "\"deviceId\":\"%s\","
+						   "\"subjectId\":\"%s\","
 						   "\"experiment\":\"%s\","
-						   "\"adv_interval\":%u,"
-						   "\"scan_interval\":%u,"
-						   "\"inactivity_multiplier\":%u}",
+						   "\"advInterval\":%u,"
+						   "\"scanInterval\":%u,"
+						   "\"inactivityMultiplier\":%u}",
 						   JUXTA_FIRMWARE_VERSION, battery_level, memory_level, device_id,
 						   settings->subject_id, settings->experiment, settings->adv_interval_s,
 						   settings->scan_interval_s,
@@ -474,17 +401,17 @@ static int apply_gateway_command(const char *json)
 		juxta_ble_datetime_synchronized();
 	}
 
-	if (gateway_flag_true(json, "send_filenames", "sendFilenames"))
+	if (extract_bool_true(json, "sendFilenames"))
 	{
 		(void)send_file_listing(current_conn);
 	}
 
-	if (gateway_flag_true(json, "clear_memory", "clearMemory"))
+	if (extract_bool_true(json, "clearMemory"))
 	{
 		/* Always honored — explicit destructive action, not gated by production_ready.
 		 * Erase only; file creation is deferred to the next data write (ProductionInit
 		 * "boot" event or first vitals/scan row), consistent with the init path. */
-		LOG_INF("clear_memory: erasing all NOR CSV regions");
+		LOG_INF("clearMemory: erasing all NOR CSV regions");
 		(void)juxta_log_format(log_ctx);
 	}
 
@@ -496,52 +423,51 @@ static int apply_gateway_command(const char *json)
 		juxta_ble_reset_requested(); /* does not return */
 	}
 
-	if (gateway_u32(json, "scan_interval", "scanInterval", &value) == 0 && value <= UINT16_MAX)
+	if (extract_u32(json, "scanInterval", &value) == 0 && value <= UINT16_MAX)
 	{
 		if (value > JUXTA_MAX_BLE_INTERVAL_S)
 		{
-			LOG_WRN("gateway scan_interval=%u clamped to %u", value, JUXTA_MAX_BLE_INTERVAL_S);
+			LOG_WRN("gateway scanInterval=%u clamped to %u", value, JUXTA_MAX_BLE_INTERVAL_S);
 			value = JUXTA_MAX_BLE_INTERVAL_S;
 		}
 		next.scan_interval_s = (uint16_t)value;
 		changed = true;
 	}
-	if (gateway_u32(json, "adv_interval", "advInterval", &value) == 0 && value <= UINT16_MAX)
+	if (extract_u32(json, "advInterval", &value) == 0 && value <= UINT16_MAX)
 	{
 		if (value > JUXTA_MAX_BLE_INTERVAL_S)
 		{
-			LOG_WRN("gateway adv_interval=%u clamped to %u", value, JUXTA_MAX_BLE_INTERVAL_S);
+			LOG_WRN("gateway advInterval=%u clamped to %u", value, JUXTA_MAX_BLE_INTERVAL_S);
 			value = JUXTA_MAX_BLE_INTERVAL_S;
 		}
 		next.adv_interval_s = (uint16_t)value;
 		changed = true;
 	}
 
-	if (gateway_u32(json, "inactivity_multiplier", "inactivityMultiplier", &value) == 0)
+	if (extract_u32(json, "inactivityMultiplier", &value) == 0)
 	{
 		if (value < JUXTA_DEFAULT_INACTIVITY_MULTIPLIER)
 		{
-			LOG_WRN("gateway inactivity_multiplier=%u clamped to %u", value,
+			LOG_WRN("gateway inactivityMultiplier=%u clamped to %u", value,
 				JUXTA_DEFAULT_INACTIVITY_MULTIPLIER);
 			value = JUXTA_DEFAULT_INACTIVITY_MULTIPLIER;
 		}
 		else if (value > JUXTA_MAX_INACTIVITY_MULTIPLIER)
 		{
-			LOG_WRN("gateway inactivity_multiplier=%u clamped to %u", value,
+			LOG_WRN("gateway inactivityMultiplier=%u clamped to %u", value,
 				JUXTA_MAX_INACTIVITY_MULTIPLIER);
 			value = JUXTA_MAX_INACTIVITY_MULTIPLIER;
 		}
 		next.inactivity_multiplier = (uint8_t)value;
 		changed = true;
 	}
-	if (gateway_u32(json, "vitals_interval", "vitalsInterval", &value) == 0 && value > 0U &&
+	if (extract_u32(json, "vitalsInterval", &value) == 0 && value > 0U &&
 		value <= UINT16_MAX)
 	{
 		next.vitals_interval_s = (uint16_t)value;
 		changed = true;
 	}
-	if (gateway_string(json, "subject_id", "subjectId", next.subject_id, sizeof(next.subject_id)) ==
-		0)
+	if (extract_string(json, "subjectId", next.subject_id, sizeof(next.subject_id)) == 0)
 	{
 		changed = true;
 	}

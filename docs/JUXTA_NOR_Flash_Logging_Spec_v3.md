@@ -269,6 +269,9 @@ unix,event,device_id,subject_id,experiment,fw_version,mode,scan_interval_s,vital
 
 The **`mode`** column name is retained for schema compatibility. **Juxta5-8** firmware does not store or vary operating mode; every JXS row uses the literal **`normal`**.
 
+**Juxta5-8 production firmware** (`applications/juxta5-8-prod`, `JUXTA_LOG_SCHEMA` `jxta-nor-csv-v5`): JXS rows omit `mode` and include **`adv_interval_s`** after **`scan_interval_s`**:  
+`unix,event,device_id,subject_id,experiment,fw_version,scan_interval_s,adv_interval_s,vitals_interval_s,ble_name`.
+
 ## Example Rows
 
 ```csv

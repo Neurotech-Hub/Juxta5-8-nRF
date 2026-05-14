@@ -109,9 +109,9 @@ Bring-up and feature work are intentionally split into separate apps so each sub
 
 ### `applications/juxta5-8-prod` (Implemented)
 - **Purpose**: Production Hublink firmware. Combines BLE peripheral advertising/scanning, LIS2DH12 motion/temperature, battery monitoring, and append-only NOR CSV logging (JXS settings/events, JXV vitals, JXB BLE observations). Settings persist in nRF52840 internal flash (NVS). External NOR holds only self-describing CSV log files recoverable by flash scan.
-- **BLE**: Hublink service UUIDs preserved for iOS compatibility. Node reports **snake_case** JSON: `firmware_version` (must start with **`5.8`**), `battery_level`, `memory_level`, `device_id`, `subject_id`, `experiment`, `adv_interval`, `scan_interval`, `inactivity_multiplier`. Gateway accepts the same settings keys plus `timestamp`, `send_filenames`, `clear_memory`, `reset`, `vitals_interval` (legacy camelCase still accepted on write). Filename listing uses legacy `name|size;EOF` wire format; file transfer concludes with a standalone **`EOF`** (3-byte) indication after CSV data chunks. MTU exchange and 4 s supervision timeout requested on connect.
+- **BLE**: Hublink service UUIDs preserved for iOS compatibility. Node and Gateway JSON use **camelCase** (`firmwareVersion` must start with **`5.8`**, `batteryLevel`, `memoryLevel`, `deviceId`, `subjectId`, `experiment`, `advInterval`, `scanInterval`, `inactivityMultiplier`; gateway adds `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `vitalsInterval`). Filename listing uses legacy `name|size;EOF` wire format; file transfer concludes with a standalone **`EOF`** (3-byte) indication after CSV data chunks. MTU exchange and 4 s supervision timeout requested on connect.
 - **Boot / shelf**: Fresh power-on → System OFF. Magnet wake → measure hold duration. < 7 s → normal wake (connectable adv, datetime sync required). ≥ 7 s → DFU (MCUboot SMP BLE when configured). Production magnet hold (not connected) → 5× blink → 5 s debounce → shelf. Debugger detected via `CoreDebug->DHCSR` and shelf/wake/DFU simulated in-band.
-- **Battery**: FUEL on P0.30/AIN6. Calibrated factor 7.96× (was 7.82). Brownout at 2.9 V → shelf; DFU access gated at 3.2 V; `low_battery` event logged in JXS before poweroff.
+- **Battery**: FUEL on P0.30/AIN6. Calibrated factor 7.96× (was 7.82). Brownout at **2.75** V → shelf; DFU access gated at 3.2 V; `low_battery` event logged in JXS before poweroff.
 - **NOR layout**: `0x000000–0x00FFFF` JXS (64 KB), `0x010000–0x10FFFF` JXV (1 MB), `0x110000–0x3FFFFF` JXB (3 MB).
 - **Deprecated**: ADC burst / electric mode removed entirely.
 - **Dependencies**: BLE peripheral + observer + GATT client (MTU exchange), SPI NOR, NVS, LIS2DH12 SPI, SAADC P0.30/AIN6, watchdog, RTT.
@@ -163,13 +163,13 @@ Execution status:
 
 1. Build and flash `applications/juxta5-8-prod` for `Juxta5-8_nRF52840`.
 2. RTT should log device ID (`JX_XXXXXX`), NVS settings load, NOR log init, and a `boot` row appended to `JXS`.
-3. Connect with nRF Connect or the iOS companion app. Node characteristic should return JSON with `"firmware_version":"5.8.0"`, `"device_id":"JX_…"`, and the settings keys above (`adv_interval`, `scan_interval`, etc.).
+3. Connect with nRF Connect or the iOS companion app. Node characteristic should return JSON with `"firmwareVersion":"5.8.0"`, `"deviceId":"JX_…"`, and the settings keys above (`advInterval`, `scanInterval`, etc.).
 4. Write gateway JSON `{"timestamp":1746000000}`. RTT logs timestamp accepted; `JXS` gets a `time_set` row.
-5. Write gateway JSON `{"send_filenames":true}`. Filename characteristic indication lists `JXS*.csv;JXV*.csv;JXB*.csv` with sizes.
+5. Write gateway JSON `{"sendFilenames":true}`. Filename characteristic indication lists `JXS*.csv;JXV*.csv;JXB*.csv` with sizes.
 6. Write a listed filename to the filename characteristic. File-transfer stream: CSV-only data indications (payload byte count equals listing **size**), then one final **`EOF`** (3-byte) indication — not `#EOF`/NOR terminator in the CSV payload.
 7. Allow device to run one `vitals_interval_s`. RTT logs vitals; `JXV` byte count grows.
 8. With another `JX_XXXXXX` device nearby, let a scan cycle complete. RTT logs peers; `JXB` rows are appended.
-9. Write `{"clear_memory":true}`. NOR regions erase and fresh CSV files are created with a `memory_cleared` event. Internal settings survive (reconnect, read Node; `subject_id` and `experiment` unchanged).
+9. Write `{"clearMemory":true}`. NOR regions erase and fresh CSV files are created with a `memory_cleared` event. Internal settings survive (reconnect, read Node; `subjectId` and `experiment` unchanged).
 10. Power cycle; RTT shows NVS settings reloaded and NOR log cache recovered without re-scanning flash.
 
 ### Later app validation placeholders

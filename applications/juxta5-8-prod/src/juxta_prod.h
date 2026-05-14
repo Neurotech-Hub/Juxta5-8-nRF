@@ -5,8 +5,8 @@
 
 #define JUXTA_PRODUCT_NAME "Juxta5-8"
 #define JUXTA_FIRMWARE_VERSION "5.8.0"
-#define JUXTA_LOG_SCHEMA "jxta-nor-csv-v4"
-#define JUXTA_LOGGING_VERSION 4
+#define JUXTA_LOG_SCHEMA "jxta-nor-csv-v5"
+#define JUXTA_LOGGING_VERSION 5
 
 #define JUXTA_DEVICE_ID_LEN 10
 #define JUXTA_SUBJECT_ID_LEN 32

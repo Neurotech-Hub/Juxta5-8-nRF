@@ -1,6 +1,6 @@
 # juxta5-8-prod
 
-Production Hublink firmware for Juxta5-8 (nRF52840). Combines Hublink GATT BLE, append-only NOR CSV logging, and LIS2DH12 motion/temperature sensing. Settings persist in nRF52840 internal flash. **BLE radiated TX** defaults to **+8 dBm** via `CONFIG_BT_CTLR_TX_PWR_ANTENNA` in the [`Juxta5-8_nRF52840`](../../boards/NeurotechHub/Juxta5-8_nRF52840/Juxta5-8_nRF52840_defconfig) board defconfig (when Bluetooth is enabled in the build).
+Production Hublink firmware for Juxta5-8 (nRF52840). Combines Hublink GATT BLE, append-only NOR CSV logging, and LIS2DH12 motion/temperature sensing. Settings persist in nRF52840 internal flash. **BLE radiated TX** defaults to **+8 dBm** via `CONFIG_BT_CTLR_TX_PWR_ANTENNA` in the `[Juxta5-8_nRF52840](../../boards/NeurotechHub/Juxta5-8_nRF52840/Juxta5-8_nRF52840_defconfig)` board defconfig (when Bluetooth is enabled in the build).
 
 ---
 
@@ -43,7 +43,7 @@ Slow blink (50 ms ON / 450 ms OFF) — waiting for iOS connection
 
 ```
 IDLE
- ├─ scan interval elapsed  → SCANNING (3 s passive burst) → flush JXB rows → IDLE
+ ├─ scan interval elapsed  → SCANNING (1 s passive burst) → flush JXB rows → IDLE
  ├─ adv interval elapsed   → ADVERTISING (0.5 s non-conn) → IDLE
  └─ iOS connects           → CONNECTED (radio owned by BT stack)
                                      └─ disconnect → IDLE
@@ -57,7 +57,7 @@ Parallel vitals timer (every vitals_interval_s):
 
 ### Scanning vs advertising (operational BLE)
 
-After **production init** (`hardware_ready`), the device never runs **non-connectable advertising** and **passive scanning** at the same time. `**adv_interval_s`** and `**scan_interval_s**` are **any whole-second integer from 0 to 120** (no stepping): **0** turns off that modality; values **> 120** are clamped to **120** when saved. **Opportunistic connectable advertising** after overhearing a `**JXGA_`** name is **disabled** by default (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` = 0 unless overridden at compile time; default in `[src/main.c](src/main.c)`). A `**k_timer`** (`state_timer`) wakes a `**k_work**` handler (`state_work_handler`) on a schedule; each invocation **tears down** whatever phase was active (stop adv and/or stop scan), returns to an internal **IDLE** bookkeeping state, then optionally starts **one** new phase.
+After **production init** (`hardware_ready`), the device never runs **non-connectable advertising** and **passive scanning** at the same time. `**adv_interval_s`** and `**scan_interval_s`** are **any whole-second integer from 0 to 120** (no stepping): **0** turns off that modality; values **> 120** are clamped to **120** when saved. **Opportunistic connectable advertising** after overhearing a `**JXGA_`** name is **disabled** by default (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` = 0 unless overridden at compile time; default in `[src/main.c](src/main.c)`). A `**k_timer`** (`state_timer`) wakes a `**k_work`** handler (`state_work_handler`) on a schedule; each invocation **tears down** whatever phase was active (stop adv and/or stop scan), returns to an internal **IDLE** bookkeeping state, then optionally starts **one** new phase.
 
 **Phases (mutually exclusive on the radio during normal operation)**
 
@@ -65,7 +65,7 @@ After **production init** (`hardware_ready`), the device never runs **non-connec
 | Phase                                            | What starts                                                                   | How long (`state_timer`)      | Purpose                                                                                                                                                                       |
 | ------------------------------------------------ | ----------------------------------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Non-connectable advertising**                  | `start_nonconn_adv()` — fast interval, name in AD only                        | `ADV_BURST_MS` (**500 ms**)   | Broadcast `JX_…` identity so other Juxta units can see us                                                                                                                     |
-| **Passive scanning**                             | `start_scanning()` — stops any adv first, 100 ms gap, then `bt_le_scan_start` | `SCAN_BURST_MS` (**3000 ms**) | Listen for peer `JX_…` names; queue events for **JXB** logging after the burst                                                                                                |
+| **Passive scanning**                             | `start_scanning()` — stops any adv first, 100 ms gap, then `bt_le_scan_start` | `SCAN_BURST_MS` (**1000 ms**) | Listen for peer `JX_…` names; queue events for **JXB** logging after the burst                                                                                                |
 | **Connectable “gateway” advertising** (optional) | `start_connectable_adv()` (Hublink, full GATT)                                | `GATEWAY_ADV_MS` (**30 s**)   | When `JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` is **1**: after a `**JXGA_`** name is overheard in scan, open a connectable window for an iOS gateway. **Default build: disabled.** |
 
 
@@ -81,9 +81,9 @@ After **production init** (`hardware_ready`), the device never runs **non-connec
 | AD payload                                       | `BT_DATA_NAME_COMPLETE`               | Local name `JX_…` (`adv_name`); non-connectable, identity-only burst for peer discovery.                                                                                                              |
 
 
-**When both “due”, scan wins.** After going IDLE, the handler evaluates `**scan_due`** only if `**scan_interval_s` ≠ 0** (`juxta_time_now()` ≥ `last_scan_ts` + effective `**scan_interval_s`**), then `**adv_due**` only if `**adv_interval_s` ≠ 0** (≥ `last_adv_ts` + `**adv_interval_s`**). If both intervals are **0**, periodic scan and non-connectable advertising are skipped and the state timer is not armed for them (connectable use cases unchanged). If `JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` is enabled, `**do_gateway_adv`** (set when a scanned name begins with `**JXGA_**`) is evaluated **before** `scan_due` / `adv_due`. If nothing applies, it programs the timer for the **earlier** of the next enabled scan vs adv deadline, plus a small **random jitter** (0–999 ms) to desynchronize colliding devices.
+**When both “due”, scan wins.** After going IDLE, the handler evaluates `**scan_due`** only if `**scan_interval_s` ≠ 0** (`juxta_time_now()` ≥ `last_scan_ts` + effective `**scan_interval_s`**), then `**adv_due`** only if `**adv_interval_s` ≠ 0** (≥ `last_adv_ts` + `**adv_interval_s`**). If both intervals are 0, periodic scan and non-connectable advertising are skipped and the state timer is not armed for them (connectable use cases unchanged). If `JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` is enabled, `**do_gateway_adv`** (set when a scanned name begins with `**JXGA_**`) is evaluated **before** `scan_due` / `adv_due`. If nothing applies, it programs the timer for the **earlier** of the next enabled scan vs adv deadline, plus a small **random jitter** (0–999 ms) to desynchronize colliding devices.
 
-**Timing note:** `scan_due` / `adv_due` use `**juxta_time_now()` in whole seconds**, so `**ADV_BURST_MS` (500) and `SCAN_BURST_MS` (3000) are not a harmful “divisor” relationship** for the state machine—bursts are sequential one-shots. **Idle-period jitter** (0–999 ms on the next sleep) spreads peer wakeups when many devices use similar intervals; it does not randomize burst lengths.
+**Timing note:** `scan_due` / `adv_due` use `**juxta_time_now()` in whole seconds**, so `**ADV_BURST_MS` (500) and `SCAN_BURST_MS` (1000) are not a harmful “divisor” relationship** for the state machine—bursts are sequential one-shots. **Idle-period jitter** (0–999 ms on the next sleep) spreads peer wakeups when many devices use similar intervals; it does not randomize burst lengths.
 
 **While an iOS client is connected** (`ble_connected`), the work handler **returns immediately** — the stack owns the connection; scan/adv cycling resumes from **IDLE** after disconnect (see `on_disconnected` in the same file).
 
@@ -91,19 +91,21 @@ After **production init** (`hardware_ready`), the device never runs **non-connec
 
 ### Measured current draw (battery terminals)
 
-Average current **probed at the battery terminals** (µA). Bench setup: **+8 dBm** TX where noted (`CONFIG_BT_CTLR_TX_PWR_ANTENNA` on this board); values depend on supply, RF environment, and build. **Est. 40 mAh lifetime** assumes a **40 mAh** LiPo and continuous drain at the stated average: **40 000 ÷ I_µA** hours (then shown as days or hours for readability). Does not include self-discharge, end-of-life voltage, or duty-cycle nuance on sub-minute burst rows.
+Average current **probed at the battery terminals** (µA). Bench setup: **+8 dBm** TX where noted (`CONFIG_BT_CTLR_TX_PWR_ANTENNA` on this board); values depend on supply, RF environment, and build. **Est. 40 mAh lifetime** assumes a **40 mAh** LiPo and continuous drain at the stated average: **40 000 ÷ I_µA** hours (then shown as days or hours for readability). Does not include self-discharge, end-of-life voltage, or duty-cycle nuance on sub-minute burst rows. **Scan‑burst rows** below used **3** s `SCAN_BURST_MS` at measurement time; firmware now uses **1** s—expect lower average current (re‑bench to refresh numbers).
+
 
 | Scenario                               | Conditions¹                                                                          | Rec. (s) | Avg (µA) | Est. 40 mAh lifetime |
-| -------------------------------------- | ------------------------------------------------------------------------------------ | -------: | -------: | -------------------- |
-| Shelf (System OFF)                     | `scan_interval_s` / `adv_interval_s` = 0 / 0, no radio                               |       10 |    8.685 | 192 d (4610 h)       |
-| Idle production (no periodic scan/adv) | Periodic scan/adv disabled (0/0), **not** System OFF — LIS2DH12 + vitals path active |       60 |  30.9235 | 54 d (1293 h)        |
-| Non-connectable adv burst only         | 0.5 s non-conn adv window, no scan                                                   |      0.5 |  155.637 | 257 h (10.7 d)       |
-| Passive scan burst only                | 3 s passive scan, no adv                                                             |        3 |  2801.27 | 14.3 h (0.6 d)       |
-| Balanced routine                       | Scan every **30** s, adv every **5** s (3 s scan burst, 0.5 s adv burst)             |      120 |  276.353 | 145 h (6.0 d)        |
-| Low-duty routine                       | Scan every **60** s, adv every **20** s (3 s / 0.5 s bursts)                         |      120 |  186.376 | 215 h (8.9 d)        |
-| High-duty routine                      | Scan every **10** s, adv every **1** s (3 s / 0.5 s bursts)                          |      120 |  707.859 | 56.5 h (2.4 d)       |
+| -------------------------------------- | ------------------------------------------------------------------------------------ | -------- | -------- | -------------------- |
+| Shelf (System OFF)                     | `scan_interval_s` / `adv_interval_s` = 0 / 0, no radio                               | 10       | 8.685    | 192 d (4610 h)       |
+| Idle production (no periodic scan/adv) | Periodic scan/adv disabled (0/0), **not** System OFF — LIS2DH12 + vitals path active | 60       | 30.9235  | 54 d (1293 h)        |
+| Non-connectable adv burst only         | 0.5 s non-conn adv window, no scan                                                   | 0.5      | 155.637  | 257 h (10.7 d)       |
+| Passive scan burst only                | 3 s passive scan, no adv                                                             | 3        | 2801.27  | 14.3 h (0.6 d)       |
+| Balanced routine                       | Scan every **30** s, adv every **5** s (3 s scan burst, 0.5 s adv burst)             | 120      | 276.353  | 145 h (6.0 d)        |
+| Low-duty routine                       | Scan every **60** s, adv every **20** s (3 s / 0.5 s bursts)                         | 120      | 186.376  | 215 h (8.9 d)        |
+| High-duty routine                      | Scan every **10** s, adv every **1** s (3 s / 0.5 s bursts)                          | 120      | 707.859  | 56.5 h (2.4 d)       |
 
-¹Burst lengths (**3** s scan, **0.5** s non-conn adv) match production `SCAN_BURST_MS` / `ADV_BURST_MS` in [`src/main.c`](src/main.c). Interval columns are NVS / gateway `scan_interval_s` and `adv_interval_s`.
+
+¹Production `SCAN_BURST_MS` / `ADV_BURST_MS` in `[src/main.c](src/main.c)`: **1** s passive scan burst, **0.5** s non-conn adv. Interval columns in routine rows are NVS / gateway `scan_interval_s` and `adv_interval_s`. Tabulated **Avg (µA)** for scan‑heavy scenarios predates the **1** s scan window (captured with **3** s bursts).
 
 ---
 
@@ -135,7 +137,7 @@ stateDiagram-v2
     IDLE --> ADVERTISING : adv interval elapsed
     %% JXGA_ connectable gateway adv (CONNECTABLE_ADV) disabled when JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=0
 
-    SCANNING --> IDLE : 3 s burst done\nflush JXB rows
+    SCANNING --> IDLE : 1 s burst done\nflush JXB rows
     ADVERTISING --> IDLE : 0.5 s burst done
 
     IDLE --> CONNECTED : iOS connects
@@ -188,77 +190,77 @@ All BLE communication uses the **Hublink service** (`57617368-5501-0001-8000-008
 
 ### Node characteristic (READ → iOS)
 
-Single JSON object. iOS reads this once on connect. Keys are **snake_case** and match the Gateway write vocabulary. `firmware_version` must begin with `**5.8`** or the companion app disconnects.
+Single JSON object. iOS reads this once on connect. Keys are **camelCase**. `firmwareVersion` must begin with `**5.8**` or the companion app disconnects.
 
 ```json
 {
-  "firmware_version": "5.8.0",
-  "battery_level": 87,
-  "memory_level": 12,
-  "device_id": "JX_9B10A1",
-  "subject_id": "JX_9B10A1",
+  "firmwareVersion": "5.8.0",
+  "batteryLevel": 87,
+  "memoryLevel": 12,
+  "deviceId": "JX_9B10A1",
+  "subjectId": "JX_9B10A1",
   "experiment": "",
-  "adv_interval": 5,
-  "scan_interval": 30,
-  "inactivity_multiplier": 1
+  "advInterval": 5,
+  "scanInterval": 30,
+  "inactivityMultiplier": 1
 }
 ```
 
 
-| Field                | Type          | Description                                                                                                                                                                        |
-| -------------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `firmware_version`   | string        | Semantic version; must start with `**5.8**` for the iOS app                                                                                                                        |
-| `battery_level`      | integer 0–100 | Percent from SAADC (3.0 V = 0 %, 4.2 V = 100 %)                                                                                                                                    |
-| `memory_level`       | integer 0–100 | Approximate NOR log fill across JXS+JXV+JXB regions                                                                                                                                |
-| `device_id`          | string        | Stable hardware ID `JX_XXXXXX` (last 3 identity bytes)                                                                                                                             |
-| `subject_id`         | string        | NVS subject; Gateway may set via `subject_id`                                                                                                                                      |
-| `experiment`         | string        | NVS experiment (empty until set via Gateway)                                                                                                                                       |
-| `adv_interval`       | integer       | **0** = disable non-connectable advertising; otherwise **1–120** s, any integer (NVS + Gateway; values **> 120** clamped on save)                                                  |
-| `scan_interval`      | integer       | **0** = disable passive scan bursts; otherwise **1–120** s, any integer (NVS + Gateway; values **> 120** clamped on save)                                                          |
-| `inactivity_multiplier` | integer **1–10** | When **> 1**, passive **scan** cadence uses **`scan_interval_s` × multiplier** (capped at **120** s) if the last vitals window had zero LIS2DH12 motion events; **`1`** = no stretch. Does **not** change `adv_interval_s`. Ignored when `scan_interval_s` is **0** |
+| Field                    | Type             | Description                                                                                                                                                                                                                                                         |
+| ------------------------ | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `firmwareVersion`        | string           | Semantic version; must start with `**5.8**` for the iOS app                                                                                                                                                                                                         |
+| `batteryLevel`           | integer 0–100    | Percent from SAADC (3.0 V = 0 %, 4.2 V = 100 %)                                                                                                                                                                                                                     |
+| `memoryLevel`            | integer 0–100    | Approximate NOR log fill across JXS+JXV+JXB regions                                                                                                                                                                                                                 |
+| `deviceId`               | string           | Stable hardware ID `JX_XXXXXX` (last 3 identity bytes)                                                                                                                                                                                                              |
+| `subjectId`              | string           | NVS subject; Gateway may set via `subjectId` on write                                                                                                                                                                                                               |
+| `experiment`             | string           | NVS experiment (empty until set via Gateway)                                                                                                                                                                                                                        |
+| `advInterval`            | integer          | **0** = disable non-connectable advertising; otherwise **1–120** s, any integer (NVS + Gateway; values **> 120** clamped on save)                                                                                                                                   |
+| `scanInterval`           | integer          | **0** = disable passive scan bursts; otherwise **1–120** s, any integer (NVS + Gateway; values **> 120** clamped on save)                                                                                                                                           |
+| `inactivityMultiplier`   | integer **1–10** | When **> 1**, passive **scan** cadence uses `**scan_interval_s` × multiplier** (capped at **120** s) if the last vitals window had zero LIS2DH12 motion events; `**1**` = no stretch. Does **not** change `adv_interval_s`. Ignored when `scan_interval_s` is **0** |
 
 
 ---
 
 ### Gateway characteristic (WRITE → device)
 
-JSON object; any subset of keys may be sent. Unrecognized keys are ignored. Use **snake_case** keys (same as Node). For compatibility, legacy camelCase keys (`sendFilenames`, `scanInterval`, etc.) are still accepted on write. Settings writes may omit `experiment` when empty.
+JSON object; any subset of keys may be sent. Unrecognized keys are ignored. All keys are **camelCase**. Settings writes may omit `experiment` when empty.
 
 ```json
 {
   "timestamp": 1717003200,
-  "send_filenames": true,
-  "clear_memory": true,
+  "sendFilenames": true,
+  "clearMemory": true,
   "reset": true,
-  "subject_id": "001",
+  "subjectId": "001",
   "experiment": "trial-A",
-  "adv_interval": 5,
-  "scan_interval": 20,
-  "inactivity_multiplier": 1,
-  "vitals_interval": 60
+  "advInterval": 5,
+  "scanInterval": 20,
+  "inactivityMultiplier": 1,
+  "vitalsInterval": 60
 }
 ```
 
 
-| Field                | Type                | Effect                                                                                                                                            |
-| -------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `timestamp`          | uint32 Unix seconds | Sets device clock; appends `time_set` row to JXS                                                                                                  |
-| `send_filenames`     | bool                | Triggers file listing indication on Filename characteristic                                                                                       |
-| `clear_memory`       | bool                | Erases all NOR CSV regions; fresh daily files on next write; appends `memory_cleared` to JXS; **does not clear NVS settings**                     |
-| `reset`              | bool                | Immediately enters shelf mode (System OFF in production; soft reboot in debug)                                                                    |
-| `scan_interval`      | integer (seconds)   | Stored in NVS: **0** = no passive scan bursts; otherwise **1–120**, any integer (out-of-range values clamped); appends `settings_changed` to JXS  |
-| `adv_interval`       | integer (seconds)   | Stored in NVS: **0** = no non-connectable advertising; otherwise **1–120**, any integer (out-of-range values clamped); appends `settings_changed` |
-| `vitals_interval`    | integer (seconds)   | Vitals timer period; stored in NVS; appends `settings_changed`                                                                                    |
-| `inactivity_multiplier` | integer **1–10**   | Stored in NVS; scales **scan** interval after a vitals window with no motion (see Node table) |
-| `subject_id`         | string              | Subject assignment; stored in NVS; appends `settings_changed` to JXS                                                                              |
-| `experiment`         | string              | Experiment string; stored in NVS; appends `settings_changed` to JXS                                                                               |
+| Field                    | Type                | Effect                                                                                                                                            |
+| ------------------------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timestamp`              | uint32 Unix seconds | Sets device clock; appends `time_set` row to JXS                                                                                                  |
+| `sendFilenames`          | bool                | Triggers file listing indication on Filename characteristic                                                                                       |
+| `clearMemory`            | bool                | Erases all NOR CSV regions; fresh daily files on next write; appends `memory_cleared` to JXS; **does not clear NVS settings**                     |
+| `reset`                  | bool                | Immediately enters shelf mode (System OFF in production; soft reboot in debug)                                                                    |
+| `scanInterval`           | integer (seconds)   | Stored in NVS: **0** = no passive scan bursts; otherwise **1–120**, any integer (out-of-range values clamped); appends `settings_changed` to JXS  |
+| `advInterval`            | integer (seconds)   | Stored in NVS: **0** = no non-connectable advertising; otherwise **1–120**, any integer (out-of-range values clamped); appends `settings_changed` |
+| `vitalsInterval`         | integer (seconds)   | Vitals timer period; stored in NVS; appends `settings_changed`                                                                                    |
+| `inactivityMultiplier`   | integer **1–10**    | Stored in NVS; scales **scan** interval after a vitals window with no motion (see Node table)                                                     |
+| `subjectId`              | string              | Subject assignment; stored in NVS; appends `settings_changed` to JXS                                                                              |
+| `experiment`             | string              | Experiment string; stored in NVS; appends `settings_changed` to JXS                                                                               |
 
 
 ---
 
 ### File listing (Filename characteristic)
 
-Triggered by `"send_filenames": true` in a Gateway write, or by writing `"LIST"` to the Filename characteristic directly. The device sends an **indication** with a semicolon-separated list:
+Triggered by `"sendFilenames": true` in a Gateway write, or by writing `"LIST"` to the Filename characteristic directly. The device sends an **indication** with a semicolon-separated list:
 
 ```
 JXS20260507.csv|2048;JXV20260507.csv|14592;JXB20260507.csv|30720
@@ -291,6 +293,12 @@ Each entry is `filename|size_in_bytes`. **Size** is the **CSV payload** byte cou
 
 
 All regions are append-only CSV. Each pseudo-file is physically stored as:
+
+```
+JXSYYYYMMDD.csv
+unix,event,device_id,subject_id,experiment,fw_version,scan_interval_s,adv_interval_s,vitals_interval_s,ble_name
+1715200000,boot,JX_9B10A1,JX_9B10A1,,5.8.0,30,5,60,JX_9B10A1
+```
 
 ```
 JXVYYYYMMDD.csv
@@ -327,33 +335,33 @@ applications/juxta5-8-prod/
 ### Implemented
 
 
-| Feature                     | Notes                                                                                                                                                                                                                                                                                                                                                          |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Shelf mode (System OFF)     | Fresh boot → `sys_poweroff()`, MAG_INT `GPIO_INT_LEVEL_LOW` wake source                                                                                                                                                                                                                                                                                        |
-| Magnet hold measurement     | < 7 s → normal wake, ≥ 7 s → DFU path                                                                                                                                                                                                                                                                                                                          |
-| LED mode state machine      | `OFF`, `ON` (connected), `SLOW_BLINK` (50/450 ms, gateway adv), `FAST_BLINK` (50/50 ms, DFU) driven by kernel timer + work item                                                                                                                                                                                                                                |
-| LED blink sequences         | Magnet hold: solid ON; DFU entry: 3× 200 ms blink; production init: 5× 50 ms blink                                                                                                                                                                                                                                                                             |
-| Datetime sync gate          | Connectable adv after normal wake; loops indefinitely until timestamp received; must have timestamp before production init                                                                                                                                                                                                                                     |
-| Watchdog                    | 30 s window, fed every 10 s, pauses on debug halt                                                                                                                                                                                                                                                                                                              |
-| NVS settings                | `subject_id`, `experiment`, `scan_interval_s`, `vitals_interval_s`, `adv_interval_s`, `inactivity_multiplier` **1–10** (plus `upload_path` slot always written as `**/**`; reserved bytes for legacy blob layout)                                                                                                                                             |
-| NOR CSV logging             | JXS events, JXV vitals, JXB BLE observations; append-only, `#EOF` on close                                                                                                                                                                                                                                                                                     |
-| Daily file rotation         | `ensure_file()` in `[src/juxta_log.c](src/juxta_log.c)`: when the calendar date from the row’s `unix_time` no longer matches the active pseudo-file, the previous file is closed with `#EOF` and a new `*yyyymmdd.csv` is created per log type; requires a valid clock; old files remain until `clear_memory`                                                  |
-| Log-state cache             | MCU NVS caches file offsets; scans NOR on cache miss                                                                                                                                                                                                                                                                                                           |
-| BLE state machine           | Non-connectable advertising when `adv_interval_s` is **1–120** s, any integer (**0** = off); passive scan bursts when `scan_interval_s` is **1–120** s, any integer (**0** = off; effective scan interval **`scan_interval_s` × `inactivity_multiplier`** when multiplier **> 1** and last vitals window had no motion, capped at **120** s); JXGA_ opportunistic connectable adv **disabled** in source (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV`) |
-| Battery level in Node JSON  | SAADC mV sampled on connect and each vitals tick; calibrated factor 7.96×; linear 3.0–4.2 V → 0–100 %                                                                                                                                                                                                                                                          |
-| Battery safeguards          | Brownout < 2.9 V → shelf mode (boot + vitals timer, logs `low_battery`); DFU gate < 3.2 V → falls back to normal wake                                                                                                                                                                                                                                          |
-| Hublink GATT service        | Node, Gateway, Filename, File Transfer characteristics; UUIDs match iOS companion                                                                                                                                                                                                                                                                              |
-| DFU (MCUboot SMP BLE)       | Long magnet hold: `bt_enable`, SMP advertising, nRF Device Manager; magnet swipe → shelf                                                                                                                                                                                                                                                                       |
-| Node JSON                   | Spec keys: `firmware_version`, `battery_level`, `memory_level`, `device_id`, `subject_id`, `experiment`, `adv_interval`, `scan_interval`, `inactivity_multiplier`                                                                                                                                                                                            |
-| Gateway commands            | `timestamp`, `send_filenames`, `clear_memory`, `reset`, `scan_interval`, `adv_interval`, `vitals_interval`, `subject_id`, `experiment`, `inactivity_multiplier` (legacy camelCase still accepted)                                                                                                                                                                 |
-| BLE connection optimisation | MTU exchange initiated on connect; supervision timeout 4 s; preferred interval 30–50 ms via `bt_conn_le_param_update`                                                                                                                                                                                                                                          |
-| Production magnet-to-shelf  | Magnet held in production (not connected) → 5× blink → 5 s debounce → shelf mode                                                                                                                                                                                                                                                                               |
-| Debugger simulation loop    | `CoreDebug->DHCSR` detects J-Link; simulates shelf/wake/DFU cycle in-band; `sys_reboot()` restarts loop                                                                                                                                                                                                                                                        |
-| Vitals logging              | LIS2DH12 temperature, SAADC battery voltage, motion count → JXV; motion snapshot also drives inactivity **scan** interval multiplier                                                                                                                                                                                                                          |
-| BLE observation logging     | `JX_XXXXXX` peer detection → JXB rows with observer/peer/rssi                                                                                                                                                                                                                                                                                                  |
-| JXS provenance rows         | `boot`, `time_set`, `settings_changed`, `user_connected`, `user_disconnected`, `memory_cleared`, `low_battery`                                                                                                                                                                                                                                                 |
-| File listing wire format    | `name                                                                                                                                                                                                                                                                                                                                                          | size;name | size;EOF` — matches legacy juxta-ble iOS parser |
-| FUEL pin correction         | FUEL on P0.30/AIN6 (was incorrectly mapped to P0.28/AIN4 = AXY_INT2)                                                                                                                                                                                                                                                                                           |
+| Feature                     | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Shelf mode (System OFF)     | Fresh boot → `sys_poweroff()`, MAG_INT `GPIO_INT_LEVEL_LOW` wake source                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Magnet hold measurement     | < 7 s → normal wake, ≥ 7 s → DFU path                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| LED mode state machine      | `OFF`, `ON` (connected), `SLOW_BLINK` (50/450 ms, gateway adv), `FAST_BLINK` (50/50 ms, DFU) driven by kernel timer + work item                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| LED blink sequences         | Magnet hold: solid ON; DFU entry: 3× 200 ms blink; production init: 5× 50 ms blink                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Datetime sync gate          | Connectable adv after normal wake; loops indefinitely until timestamp received; must have timestamp before production init                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Watchdog                    | 30 s window, fed every 10 s, pauses on debug halt                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| NVS settings                | `subject_id`, `experiment`, `scan_interval_s`, `vitals_interval_s`, `adv_interval_s`, `inactivity_multiplier` **1–10** (plus `upload_path` slot always written as `**/**`; reserved bytes for legacy blob layout)                                                                                                                                                                                                                                                                                                                                    |
+| NOR CSV logging             | JXS events, JXV vitals, JXB BLE observations; append-only, `#EOF` on close                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Daily file rotation         | `ensure_file()` in `[src/juxta_log.c](src/juxta_log.c)`: when the calendar date from `unix_time` no longer matches the active pseudo-file, the previous file is closed with `#EOF` and a new `*yyyymmdd.csv` is created. On each new **calendar day**, the first JXS/JXV/JXB append runs `touch_all_for_calendar_day()` so **all three** types get a dated file for that day (header + schema row only if there are no data rows yet), giving the gateway a consistent triple per day. Requires a valid clock; old files remain until Gateway `clearMemory` |
+| Log-state cache             | MCU NVS caches file offsets; scans NOR on cache miss                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| BLE state machine           | Non-connectable advertising when `adv_interval_s` is **1–120** s, any integer (**0** = off); passive scan bursts when `scan_interval_s` is **1–120** s, any integer (**0** = off; effective scan interval `**scan_interval_s` × `inactivity_multiplier**` when multiplier **> 1** and last vitals window had no motion, capped at **120** s); JXGA_ opportunistic connectable adv **disabled** in source (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV`)                                                                                                      |
+| Battery level in Node JSON  | SAADC mV sampled on connect and each vitals tick; calibrated factor 7.96×; linear 3.0–4.2 V → 0–100 %                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Battery safeguards          | Brownout < **2.75** V → shelf mode (boot + vitals timer, logs `low_battery`); DFU gate < 3.2 V → falls back to normal wake                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Hublink GATT service        | Node, Gateway, Filename, File Transfer characteristics; UUIDs match iOS companion                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| DFU (MCUboot SMP BLE)       | Long magnet hold: `bt_enable`, SMP advertising, nRF Device Manager; magnet swipe → shelf                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Node JSON                   | Spec keys: `firmwareVersion`, `batteryLevel`, `memoryLevel`, `deviceId`, `subjectId`, `experiment`, `advInterval`, `scanInterval`, `inactivityMultiplier`                                                                                                                                                                                                                                                                                                                                                                                    |
+| Gateway commands            | `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `scanInterval`, `advInterval`, `vitalsInterval`, `subjectId`, `experiment`, `inactivityMultiplier`                                                                                                                                                                                                                                                                                                                                                    |
+| BLE connection optimisation | MTU exchange initiated on connect; supervision timeout 4 s; preferred interval 30–50 ms via `bt_conn_le_param_update`                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Production magnet-to-shelf  | Magnet held in production (not connected) → 5× blink → 5 s debounce → shelf mode                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Debugger simulation loop    | `CoreDebug->DHCSR` detects J-Link; simulates shelf/wake/DFU cycle in-band; `sys_reboot()` restarts loop                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Vitals logging              | LIS2DH12 temperature, SAADC battery voltage, motion count → JXV; motion snapshot also drives inactivity **scan** interval multiplier                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| BLE observation logging     | `JX_XXXXXX` peer detection → JXB rows with observer/peer/rssi                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| JXS provenance rows         | `boot`, `time_set`, `settings_changed`, `user_connected`, `user_disconnected`, `memory_cleared`, `low_battery`                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| File listing wire format    | `name                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| FUEL pin correction         | FUEL on P0.30/AIN6 (was incorrectly mapped to P0.28/AIN4 = AXY_INT2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 
 ### Pending / Not Yet Implemented
@@ -361,6 +369,6 @@ applications/juxta5-8-prod/
 
 | Feature                             | Notes                                                                                                                                                                                                                                                                      |
 | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **JXGA_ opportunistic gateway adv** | Post–ProductionInit connectable advertising after overhearing `JXGA_`* in scan is **compiled out** (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` = 0). Re-enable with `-DJUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=1` or by defining the macro to **1** before the `#ifndef` in `main.c`. |
+| **JXGA_ opportunistic gateway adv** | Post–ProductionInit connectable advertising after overhearing `JXGA`_* in scan is **compiled out** (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` = 0). Re-enable with `-DJUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=1` or by defining the macro to **1** before the `#ifndef` in `main.c`. |
 
 

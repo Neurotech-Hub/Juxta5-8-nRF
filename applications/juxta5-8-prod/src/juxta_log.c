@@ -37,11 +37,14 @@ struct log_region
 
 static const struct log_region regions[] = {
 	{JUXTA_LOG_JXS, "JXS",
-	 "unix,event,device_id,subject_id,experiment,fw_version,scan_interval_s,vitals_interval_s,ble_name\n",
+	 "unix,event,device_id,subject_id,experiment,fw_version,scan_interval_s,adv_interval_s,vitals_interval_s,ble_name\n",
 	 JXS_START, JXS_SIZE},
 	{JUXTA_LOG_JXV, "JXV", "unix,motion,batt_v,temp_c\n", JXV_START, JXV_SIZE},
 	{JUXTA_LOG_JXB, "JXB", "unix,observer_id,peer_id,rssi\n", JXB_START, JXB_SIZE},
 };
+
+/* YYYYMMDD for which all three log types have been aligned (see touch_all_for_calendar_day). */
+static char s_log_calendar_ymd[9];
 
 static const struct log_region *region_for_type(enum juxta_log_type type)
 {
@@ -501,6 +504,47 @@ static int ensure_file(struct juxta_log_context *ctx, enum juxta_log_type type,
 	return 0;
 }
 
+/* On calendar day change, open JXS/JXV/JXB for the new day (header only is OK)
+ * so the gateway always sees three dated files per day. */
+static int touch_all_for_calendar_day(struct juxta_log_context *ctx,
+				      const struct juxta_settings *settings,
+				      uint32_t unix_time)
+{
+	char today[9];
+	int rc;
+
+	if (!ctx || !ctx->initialized || !settings || unix_time == 0U)
+	{
+		return 0;
+	}
+
+	juxta_time_date_string(unix_time, today);
+	if (s_log_calendar_ymd[0] != '\0' && strcmp(s_log_calendar_ymd, today) == 0)
+	{
+		return 0;
+	}
+
+	rc = ensure_file(ctx, JUXTA_LOG_JXS, settings, unix_time);
+	if (rc != 0)
+	{
+		return rc;
+	}
+	rc = ensure_file(ctx, JUXTA_LOG_JXV, settings, unix_time);
+	if (rc != 0)
+	{
+		return rc;
+	}
+	rc = ensure_file(ctx, JUXTA_LOG_JXB, settings, unix_time);
+	if (rc != 0)
+	{
+		return rc;
+	}
+
+	juxta_time_date_string(unix_time, s_log_calendar_ymd);
+	LOG_INF("Daily log files for %s (JXS/JXV/JXB)", s_log_calendar_ymd);
+	return 0;
+}
+
 static int append_row(struct juxta_log_context *ctx, enum juxta_log_type type, const char *row)
 {
 	uint32_t *slot = active_slot_for_type(ctx, type);
@@ -643,12 +687,22 @@ int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *s
 	}
 
 	rc = ensure_file(ctx, JUXTA_LOG_JXS, settings, now);
-	rc |= ensure_file(ctx, JUXTA_LOG_JXV, settings, now);
-	rc |= ensure_file(ctx, JUXTA_LOG_JXB, settings, now);
 	if (rc != 0)
 	{
 		return rc;
 	}
+	rc = ensure_file(ctx, JUXTA_LOG_JXV, settings, now);
+	if (rc != 0)
+	{
+		return rc;
+	}
+	rc = ensure_file(ctx, JUXTA_LOG_JXB, settings, now);
+	if (rc != 0)
+	{
+		return rc;
+	}
+
+	juxta_time_date_string(now, s_log_calendar_ymd);
 
 	return juxta_log_append_event(ctx, settings, device_id, "boot", now);
 }
@@ -706,6 +760,7 @@ int juxta_log_format(struct juxta_log_context *ctx)
 	ctx->active_jxs = UINT32_MAX;
 	ctx->active_jxv = UINT32_MAX;
 	ctx->active_jxb = UINT32_MAX;
+	s_log_calendar_ymd[0] = '\0';
 
 	LOG_INF("NOR CSV regions erased — file creation deferred to next data write");
 	return 0;
@@ -721,16 +776,22 @@ int juxta_log_append_event(struct juxta_log_context *ctx, const struct juxta_set
 		return -EINVAL;
 	}
 
-	int rc = ensure_file(ctx, JUXTA_LOG_JXS, settings, unix_time);
+	int rc = touch_all_for_calendar_day(ctx, settings, unix_time);
 	if (rc != 0)
 	{
 		return rc;
 	}
 
-	int len = snprintf(row, sizeof(row), "%u,%s,%s,%s,%s,%s,%u,%u,%s\n", unix_time,
+	rc = ensure_file(ctx, JUXTA_LOG_JXS, settings, unix_time);
+	if (rc != 0)
+	{
+		return rc;
+	}
+
+	int len = snprintf(row, sizeof(row), "%u,%s,%s,%s,%s,%s,%u,%u,%u,%s\n", unix_time,
 					   event, device_id, settings->subject_id, settings->experiment,
 					   JUXTA_FIRMWARE_VERSION, settings->scan_interval_s,
-					   settings->vitals_interval_s, device_id);
+					   settings->adv_interval_s, settings->vitals_interval_s, device_id);
 	if (len < 0 || len >= (int)sizeof(row))
 	{
 		return -ENOSPC;
@@ -753,7 +814,13 @@ int juxta_log_append_vitals(struct juxta_log_context *ctx, uint32_t unix_time, u
 		return -EINVAL;
 	}
 
-	int rc = ensure_file(ctx, JUXTA_LOG_JXV, juxta_settings_get(), unix_time);
+	int rc = touch_all_for_calendar_day(ctx, juxta_settings_get(), unix_time);
+	if (rc != 0)
+	{
+		return rc;
+	}
+
+	rc = ensure_file(ctx, JUXTA_LOG_JXV, juxta_settings_get(), unix_time);
 	if (rc != 0)
 	{
 		return rc;
@@ -781,7 +848,13 @@ int juxta_log_append_ble_observation(struct juxta_log_context *ctx, uint32_t uni
 		return -EINVAL;
 	}
 
-	int rc = ensure_file(ctx, JUXTA_LOG_JXB, juxta_settings_get(), unix_time);
+	int rc = touch_all_for_calendar_day(ctx, juxta_settings_get(), unix_time);
+	if (rc != 0)
+	{
+		return rc;
+	}
+
+	rc = ensure_file(ctx, JUXTA_LOG_JXB, juxta_settings_get(), unix_time);
 	if (rc != 0)
 	{
 		return rc;
