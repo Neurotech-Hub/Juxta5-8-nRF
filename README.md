@@ -37,15 +37,15 @@ This repository is the active Juxta5-8 firmware workspace. The `Reference/` dire
 
 ## Software Constraints
 
-- Only FUEL ADC sampling is planned; no electric mode.
-- Memory code will target NOR flash behavior (not legacy FRAM behavior).
+- **FUEL ADC only** on production and bring-up apps (P0.30 / AIN6); no electric mode.
+- **External NOR** logging uses append-only CSV pseudo-files (not legacy FRAM behavior). See [`docs/JUXTA_NOR_Flash_Logging_Spec_v3.md`](docs/JUXTA_NOR_Flash_Logging_Spec_v3.md) and production schema **`jxta-nor-csv-v5`** in [`applications/juxta5-8-prod`](applications/juxta5-8-prod).
 
 ## Planned Application Structure
 
 Bring-up and feature work are intentionally split into separate apps so each subsystem can be validated in isolation.
 
 ### `applications/juxta5-8-blink` (Phase 2)
-- **Purpose**: Hardware sanity check for LED, magnet path, and FUEL ADC (battery divider on `P0.28` / `AIN4`).
+- **Purpose**: Hardware sanity check for LED, magnet path, and FUEL ADC (battery divider on **`P0.30` / `AIN6`**, same as production).
 - **Behavior**: **Magnet absent** ⇒ pad **high**, GPIO **inactive** ⇒ LED blinks (~200 ms); **magnet present** ⇒ pad driven **LOW**, GPIO **active** ⇒ LED forced on. RTT magnet lines mirror **inactive (“LOW blink mode”) vs active (“forced ON”)** rather than spelling out raw voltage — see Hardware Notes for polarity. Every ~2 s, RTT logs FUEL (`vfuel` / `vbatt` / rough `soc`, same divider as below).
 - **Dependencies**: GPIO, SAADC (`zephyr,user` / `io-channels` → `AIN4`), RTT logging.
 - **Reference links**:
@@ -108,11 +108,16 @@ Bring-up and feature work are intentionally split into separate apps so each sub
 - **Bring-up with host tools**: Use [`applications/juxta5-8-ble-test`](applications/juxta5-8-ble-test) if you need connectable GATT, FUEL read, or magnet-wake sleep.
 
 ### `applications/juxta5-8-prod` (Implemented)
-- **Purpose**: Production Hublink firmware. Combines BLE peripheral advertising/scanning, LIS2DH12 motion/temperature, battery monitoring, and append-only NOR CSV logging (JXS settings/events, JXV vitals, JXB BLE observations). Settings persist in nRF52840 internal flash (NVS). External NOR holds only self-describing CSV log files recoverable by flash scan.
-- **BLE**: Hublink service UUIDs preserved for iOS compatibility. Node and Gateway JSON use **camelCase** (`firmwareVersion` must start with **`5.8`**, `batteryLevel`, `memoryLevel`, `deviceId`, `subjectId`, `experiment`, `advInterval`, `scanInterval`, `inactivityMultiplier`; gateway adds `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `vitalsInterval`). Filename listing uses legacy `name|size;EOF` wire format; file transfer concludes with a standalone **`EOF`** (3-byte) indication after CSV data chunks. MTU exchange and 4 s supervision timeout requested on connect.
-- **Boot / shelf**: Fresh power-on → System OFF. Magnet wake → measure hold duration. < 7 s → normal wake (connectable adv, datetime sync required). ≥ 7 s → DFU (MCUboot SMP BLE when configured). Production magnet hold (not connected) → 5× blink → 5 s debounce → shelf. Debugger detected via `CoreDebug->DHCSR` and shelf/wake/DFU simulated in-band.
-- **Battery**: FUEL on P0.30/AIN6. Calibrated factor 7.96× (was 7.82). Brownout at **2.75** V → shelf; DFU access gated at 3.2 V; `low_battery` event logged in JXS before poweroff.
-- **NOR layout**: `0x000000–0x00FFFF` JXS (64 KB), `0x010000–0x10FFFF` JXV (1 MB), `0x110000–0x3FFFFF` JXB (3 MB).
+
+Full design, GATT tables, state machine, and validation detail: **[`applications/juxta5-8-prod/README.md`](applications/juxta5-8-prod/README.md)**.
+
+- **Purpose**: Production Hublink firmware. Combines BLE peripheral advertising/scanning, LIS2DH12 motion/temperature, battery monitoring, and append-only NOR CSV logging (JXS settings/events, JXV vitals, JXB BLE observations). Settings persist in nRF52840 internal flash (NVS). External NOR holds self-describing CSV pseudo-files recoverable by flash scan.
+- **BLE**: Hublink service UUIDs preserved for iOS compatibility. Node and Gateway JSON use **camelCase only** (`firmwareVersion` must start with **`5.8`**, `batteryLevel`, `memoryLevel`, `deviceId`, `subjectId`, `experiment`, `advInterval`, `scanInterval`, `inactivityMultiplier`; gateway adds `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `vitalsInterval`). Filename listing uses `name|size;…` wire format; file transfer concludes with a standalone **`EOF`** (3-byte) indication after CSV data chunks. MTU exchange and 4 s supervision timeout requested on connect.
+- **Boot / shelf**: Fresh power-on → System OFF. Magnet wake → measure hold duration. < 7 s → normal wake (connectable adv, datetime sync required). ≥ 7 s → DFU (MCUboot SMP BLE when configured). Production magnet hold (not connected) → 5× blink → 5 s debounce → shelf. Shelf entry stops timers, disconnects BLE, powers down LIS2DH12, then `sys_poweroff()`. **NOR or LIS2DH12 init failure** → indefinite **long blink** (1 s on / 1 s off); production does not start. Debugger detected via `CoreDebug->DHCSR` and shelf/wake/DFU simulated in-band.
+- **Radio cadence**: Non-connectable adv and passive scan bursts **1 s** each; intervals **0–120 s** (0 = off) from NVS / Gateway.
+- **Battery**: FUEL on P0.30/AIN6. Calibrated factor **7.96×** (was 7.82). Brownout at **2.75 V** → shelf + JXS `low_battery`; DFU access gated at **3.2 V**.
+- **NOR layout**: `0x000000–0x00FFFF` JXS (64 KB), `0x010000–0x10FFFF` JXV (1 MB), `0x110000–0x3FFFFF` JXB (3 MB). Schema **`jxta-nor-csv-v5`**: JXS rows include `adv_interval_s`; each new **JXV** file gets two `#device_settings` comment lines (NVS snapshot at file open). Calendar rollover creates JXS/JXV/JXB dated files for the same day.
+- **Build**: `west build -b Juxta5-8_nRF52840 applications/juxta5-8-prod`
 - **Deprecated**: ADC burst / electric mode removed entirely.
 - **Dependencies**: BLE peripheral + observer + GATT client (MTU exchange), SPI NOR, NVS, LIS2DH12 SPI, SAADC P0.30/AIN6, watchdog, RTT.
 - **Reference links**:
@@ -161,13 +166,15 @@ Execution status:
 
 ### `juxta5-8-prod` validation checklist
 
+See also the expanded checklist in [`applications/juxta5-8-prod/README.md`](applications/juxta5-8-prod/README.md#validation-checklist).
+
 1. Build and flash `applications/juxta5-8-prod` for `Juxta5-8_nRF52840`.
 2. RTT should log device ID (`JX_XXXXXX`), NVS settings load, NOR log init, and a `boot` row appended to `JXS`.
 3. Connect with nRF Connect or the iOS companion app. Node characteristic should return JSON with `"firmwareVersion":"5.8.0"`, `"deviceId":"JX_…"`, and the settings keys above (`advInterval`, `scanInterval`, etc.).
 4. Write gateway JSON `{"timestamp":1746000000}`. RTT logs timestamp accepted; `JXS` gets a `time_set` row.
 5. Write gateway JSON `{"sendFilenames":true}`. Filename characteristic indication lists `JXS*.csv;JXV*.csv;JXB*.csv` with sizes.
 6. Write a listed filename to the filename characteristic. File-transfer stream: CSV-only data indications (payload byte count equals listing **size**), then one final **`EOF`** (3-byte) indication — not `#EOF`/NOR terminator in the CSV payload.
-7. Allow device to run one `vitals_interval_s`. RTT logs vitals; `JXV` byte count grows.
+7. Allow device to run one vitals period (default **60 s**, NVS `vitals_interval_s` / Gateway `vitalsInterval`). RTT logs vitals; `JXV` byte count grows; new JXV files include `#device_settings` snapshot lines after the schema row.
 8. With another `JX_XXXXXX` device nearby, let a scan cycle complete. RTT logs peers; `JXB` rows are appended.
 9. Write `{"clearMemory":true}`. NOR regions erase and fresh CSV files are created with a `memory_cleared` event. Internal settings survive (reconnect, read Node; `subjectId` and `experiment` unchanged).
 10. Power cycle; RTT shows NVS settings reloaded and NOR log cache recovered without re-scanning flash.

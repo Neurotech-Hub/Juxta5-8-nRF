@@ -91,7 +91,11 @@ typedef enum
 	LED_MODE_ON,		 /* solid ON — connected */
 	LED_MODE_SLOW_BLINK, /* 50 ms ON / 450 ms OFF — gateway adv waiting */
 	LED_MODE_FAST_BLINK, /* 50 ms ON / 50 ms OFF  — DFU waiting */
+	LED_MODE_LONG_BLINK, /* 1 s ON / 1 s OFF — NOR or LIS2DH12 init failed */
 } led_mode_t;
+
+#define LED_LONG_BLINK_ON_MS 1000U
+#define LED_LONG_BLINK_OFF_MS 1000U
 
 static led_mode_t led_mode;
 static bool led_phase;
@@ -138,6 +142,20 @@ static void led_work_handler(struct k_work *work)
 		gpio_pin_set_dt(&led, led_phase ? 1 : 0);
 		k_timer_start(&led_timer, K_MSEC(50), K_NO_WAIT);
 		break;
+	case LED_MODE_LONG_BLINK:
+		if (led_phase)
+		{
+			gpio_pin_set_dt(&led, 1);
+			led_phase = false;
+			k_timer_start(&led_timer, K_MSEC(LED_LONG_BLINK_ON_MS), K_NO_WAIT);
+		}
+		else
+		{
+			gpio_pin_set_dt(&led, 0);
+			led_phase = true;
+			k_timer_start(&led_timer, K_MSEC(LED_LONG_BLINK_OFF_MS), K_NO_WAIT);
+		}
+		break;
 	}
 }
 
@@ -147,6 +165,17 @@ static void set_led_mode(led_mode_t mode)
 	led_mode = mode;
 	led_phase = true;
 	k_work_submit(&led_work);
+}
+
+/* Unrecoverable peripheral init — 1 s on / 1 s off forever (watchdog still fed). */
+static void enter_hw_fault_indication(const char *subsystem, int rc)
+{
+	LOG_ERR("Hardware init failed (%s): %d — long-blink fault indication", subsystem, rc);
+	set_led_mode(LED_MODE_LONG_BLINK);
+	for (;;)
+	{
+		k_sleep(K_FOREVER);
+	}
 }
 
 static void shelf_work_handler(struct k_work *work)
@@ -943,7 +972,7 @@ static void process_scan_events(void)
 /* ---------------------------------------------------------------------------
  * Operational state machine
  * -------------------------------------------------------------------------*/
-#define ADV_BURST_MS 500U
+#define ADV_BURST_MS 1000U /* Non-connectable adv burst wall time (state_timer) */
 #define SCAN_BURST_MS 1000U /* Passive scan burst wall time (state_timer) */
 #if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
 #define GATEWAY_ADV_MS 30000U
@@ -1444,8 +1473,7 @@ int main(void)
 	rc = juxta_log_init(&log_ctx, juxta_settings_get(), device_id);
 	if (rc != 0)
 	{
-		LOG_ERR("NOR log init failed: %d", rc);
-		return rc;
+		enter_hw_fault_indication("NOR flash", rc);
 	}
 
 	rc = juxta_ble_service_init(&log_ctx);
@@ -1475,7 +1503,7 @@ int main(void)
 	rc = init_accel();
 	if (rc != 0)
 	{
-		LOG_WRN("LIS2DH12 init failed: %d — continuing without accel", rc);
+		enter_hw_fault_indication("LIS2DH12", rc);
 	}
 
 	hardware_ready = true;
