@@ -25,7 +25,7 @@ RTT console is the primary runtime log (`CONFIG_USE_SEGGER_RTT=y`). Optional: en
 | `experiment` | empty | Gateway `experiment` |
 | `upload_path` | `/` | Fixed placeholder in NVS blob |
 
-Firmware version **`5.8.0`**; NOR schema **`jxta-nor-csv-v5`** (`JUXTA_LOGGING_VERSION` 5).
+Firmware version **`5.8.1`**; NOR schema **`jxta-nor-csv-v5`** (`JUXTA_LOGGING_VERSION` 5).
 
 ---
 
@@ -36,21 +36,52 @@ Firmware version **`5.8.0`**; NOR schema **`jxta-nor-csv-v5`** (`JUXTA_LOGGING_V
 ```
 Power-on / Reset
       │
-      ├─ RESETREAS == 0 (fresh power-on)
+      ├─ RESETREAS == 0 (fresh power-on / battery insertion)
       │         └─→ Shelf mode (System OFF, MAG_INT wake). No LED.
       │
       ├─ RESETREAS[OFF] set (woke from System OFF via magnet)
       │         └─→ LED ON while magnet held → measure hold duration
-      │                   ├─ < 7 s  → LED off → slow blink → Datetime sync phase
-      │                   └─ ≥ 7 s  → 3× blink → fast blink → DFU mode (MCUboot SMP BLE)
+      │                   ├─ < 3 s   → False positive: LED off on release → re-arm shelf (no datetime sync)
+      │                   ├─ 3-10 s  → LED off at 3 s mid-hold (commit cue) → slow blink → Datetime sync phase
+      │                   └─ ≥ 10 s  → LED off at 3 s → 3× blink → fast blink → DFU mode (MCUboot SMP BLE)
       │
-      └─ Other (watchdog, pin reset, lockup)
-                └─→ Skip shelf/hold, go straight to production init. No LED gate.
+      ├─ RESETREAS[DOG|LOCKUP|SREQ] (silent reset) AND NVS op_mode == PROD
+      │         └─→ Production recovery boot:
+      │                   ├─ retained RAM valid → restore RTC, JXS wdt_recovery_{dog,sreq,lockup}
+      │                   └─ retained RAM lost  → datetime sync, JXS wdt_recovery_no_rtc
+      │             Magnet not required; goes straight back to production loop.
+      │
+      └─ Other silent reset (DFU / SHELF saved mode) → existing post-reset behaviour.
 
 After datetime sync (if required), production init requires NOR log + LIS2DH12:
-      ├─ NOR or accel init OK  → vitals + scan/adv state machine
+      ├─ NOR or accel init OK  → vitals + scan/adv state machine, op_mode := PROD
       └─ NOR or accel init fail → long blink (1 s on / 1 s off) forever
 ```
+
+### Production recovery boot
+
+When the device is running production and suffers a **silent reset** (watchdog
+`DOG`, CPU `LOCKUP`, or soft `SREQ` reboot), the next boot automatically
+resumes production without requiring a magnet swipe or a gateway re-sync.
+Driven by two persistent stores:
+
+- **NVS `op_mode`** (one byte, separate key from the gateway settings blob):
+  written `SHELF` at the top of every `enter_shelf_mode()`, `DFU` at the top
+  of `enter_dfu_mode()`, and `PROD` once `juxta_ble_set_production_ready()`
+  succeeds. The recovery branch only fires when this is `PROD`, so DFU and
+  shelf-mode silent resets fall through to their existing flows untouched.
+- **Retained-RAM RTC snapshot** (`__noinit` struct with magic + version +
+  CRC32 in [`src/juxta_time.c`](src/juxta_time.c)). A 1 s `k_timer` refreshes
+  `unix_time` + `k_uptime_get_ms` while production runs; on recovery
+  `juxta_time_retained_unix()` projects the snapshot forward by the new boot's
+  uptime so the recovered RTC is accurate to ≤1 s. Invalidated explicitly on
+  every clean `enter_shelf_mode()` so a planned shelf entry never looks like
+  a recoverable production boot.
+
+Cold boot still wins: `RESETREAS == 0` (battery insertion) routes to shelf
+even when NVS `op_mode == PROD`, preserving the existing battery-insert
+behaviour. Every recovery is auditable via a `wdt_recovery_{dog,sreq,lockup,no_rtc}`
+row appended to JXS immediately after the `boot` row.
 
 ### Datetime sync phase (normal wake only)
 
@@ -146,11 +177,16 @@ stateDiagram-v2
 
     ShelfMode --> MeasureHold : Magnet applied\nSystem OFF releases → cold boot
 
-    MeasureHold --> WakeNormal : Released before 7 s\nLED off
-    MeasureHold --> DFUMode : Held >= 7 s\n3x blink then fast blink
+    MeasureHold --> ShelfMode : Released before 3 s\nFalse positive: back to shelf
+    MeasureHold --> WakeNormal : Released 3-10 s\nLED off
+    MeasureHold --> DFUMode : Held >= 10 s\n3x blink then fast blink
 
-    DFUMode --> ShelfMode : Magnet swipe after 5 s debounce\nLED off
+    DFUMode --> ShelfMode : Confirmed magnet 3+ s after 5 s debounce\nLED off
     DFUMode --> DFUMode : Fast blink waiting\n(MCUboot SMP BLE)
+    DFUMode --> DFUMode : Sub-3 s magnet brush\nFalse positive
+
+    %% Production recovery boot (silent reset + op_mode==PROD)
+    [*] --> ProductionInit : Silent reset (DOG/LOCKUP/SREQ)\n+ NVS op_mode == PROD\nRTC restored from retained RAM
 
     WakeNormal --> ConnectableAdv : Slow blink begins\nStart connectable advertising
 
@@ -191,7 +227,7 @@ stateDiagram-v2
 | **Off** | — | Shelf (no magnet), production idle, after successful sync handoff |
 | **Solid ON** | — | Magnet held at wake; BLE connected |
 | **Slow blink** | 50 ms on / 450 ms off | Datetime sync: connectable advertising, waiting for iOS |
-| **Fast blink** | 50 ms on / 50 ms off | DFU mode (magnet hold ≥ 7 s) |
+| **Fast blink** | 50 ms on / 50 ms off | DFU mode (magnet hold ≥ 10 s) |
 | **Long blink** | **1 s on / 1 s off** (indefinite) | **Hardware fault**: external NOR log init failed, or LIS2DH12 init failed — device does not enter production |
 | **Counted blinks** | 3× (DFU entry), 5× (sync OK, magnet shelf) | One-shot sequences via `led_blink()` |
 
@@ -206,17 +242,39 @@ This is distinct from **slow blink** (datetime sync) and **fast blink** (DFU).
 
 ## Magnet Gesture Reference
 
+Every magnet detection site now requires a confirmed **3 s minimum hold**
+(`MAGNET_DEBOUNCE_MS` in [`src/main.c`](src/main.c)). Sub-3 s touches are
+treated as false positives — a transient brush, RFID reader, or motor flyback
+will not cost the user a session. The DFU long-hold threshold is **10 s**
+(`DFU_HOLD_THRESHOLD_MS`, raised from 7 s) so it sits well past the debounce
+floor and is unambiguous when held deliberately.
 
-| Gesture                                       | LED feedback                     | Effect                                                    |
-| --------------------------------------------- | -------------------------------- | --------------------------------------------------------- |
-| Apply at any time (device in shelf mode)      | LED ON immediately               | Wakes device from System OFF → cold boot                                                                                       |
-| Release < 7 s after cold boot                 | LED off → slow blink (50/450 ms) | Gateway advertising mode; waits for datetime sync. JXS rows `shelf_exit`, `user_connected`, `time_set` deferred until sync     |
-| Hold ≥ 7 s after cold boot                    | 3× blink → fast blink (50/50 ms) | DFU mode; 5 s debounce then magnet swipe returns to shelf                                                                      |
+**Commit-confirmed LED cue (boot-wake and production magnet monitor):** at
+three of the four magnet detection sites — debug-shelf simulation, production
+System OFF wake, and the production-loop magnet monitor — the LED is turned
+solid ON the instant the magnet is detected, then driven low **as soon as
+the hold crosses 3 s** as a tactile "commit confirmed" cue. The user may
+release and the device commits to the next mode. On the boot-wake sites,
+keep holding past 10 s and DFU mode re-lights the LED via its 3× blink +
+fast blink. In the production-loop case the cue tells the user "release now
+and the device will go to shelf — re-apply the magnet next time to engage
+connectable advertising." The DFU exit monitor does not issue this cue
+because `LED_MODE_FAST_BLINK` owns the GPIO and would overwrite any
+one-shot drive on the next blink edge.
+
+| Gesture                                       | LED feedback                                  | Effect                                                    |
+| --------------------------------------------- | --------------------------------------------- | --------------------------------------------------------- |
+| Apply at any time (device in shelf mode)      | LED ON immediately                            | Wakes device from System OFF → cold boot                                                                                       |
+| Release < 3 s after cold boot                 | LED off on release                            | **False positive** — re-arms shelf without datetime sync or DFU; no JXS write |
+| Release 3 s ≤ t < 10 s after cold boot        | LED **off at 3 s mid-hold** → slow blink      | Gateway advertising mode; waits for datetime sync. JXS rows `shelf_exit`, `user_connected`, `time_set` deferred until sync     |
+| Hold ≥ 10 s after cold boot                   | LED off at 3 s → 3× blink → fast blink        | DFU mode; 5 s debounce then a confirmed 3 s hold returns to shelf                                                              |
 | Any connect event                             | Solid ON                         | Active BLE connection (`user_connected` in JXS once clock is valid)                                                            |
 | Disconnect after valid timestamp              | 5× blink → LED off               | Production init begins. JXS rows `user_disconnected` then `boot`                                                               |
 | Disconnect without timestamp                  | Slow blink resumes               | Restarts connectable advertising                                                                                               |
-| Magnet swipe during DFU fast-blink            | LED off                          | Returns device to shelf mode                                                                                                   |
-| Magnet held during production (not connected) | 5× blink → LED off               | 5 s debounce then shelf mode; appends `shelf_entry` to JXS                                                                     |
+| Brief magnet during DFU fast-blink (< 3 s)    | None                             | **False positive** — stays in DFU                                                                                              |
+| Confirmed magnet hold ≥ 3 s during DFU        | LED off                          | Returns device to shelf mode                                                                                                   |
+| Brief magnet during production (< 3 s)        | LED ON on apply → off on release        | **False positive** — production continues; LED confirms the gesture was seen but the commit threshold was not reached |
+| Confirmed magnet ≥ 3 s during production      | LED ON on apply → **off at 3 s** → 5× blink | Commit cue at 3 s; user may release; 5 s debounce then shelf mode; appends `shelf_entry` to JXS                       |
 | NOR or accelerometer init failure             | Long blink (1 s / 1 s)           | Fault loop; no production operation                                                                                            |
 
 ---
@@ -244,7 +302,7 @@ Single JSON object. iOS reads this once on connect. Keys are **camelCase**. `fir
 
 ```json
 {
-  "firmwareVersion": "5.8.0",
+  "firmwareVersion": "5.8.1",
   "batteryLevel": 87,
   "memoryLevel": 12,
   "deviceId": "JX_9B10A1",
@@ -348,8 +406,8 @@ All regions are append-only CSV. Each pseudo-file is physically stored as:
 ```
 JXSYYYYMMDD.csv
 unix,event,device_id,subject_id,experiment,fw_version,scan_interval_s,adv_interval_s,vitals_interval_s,ble_name
-1715200000,day_start,JX_9B10A1,JX_9B10A1,,5.8.0,30,5,60,JX_9B10A1
-1715200000,boot,JX_9B10A1,JX_9B10A1,,5.8.0,30,5,60,JX_9B10A1
+1715200000,day_start,JX_9B10A1,JX_9B10A1,,5.8.1,30,5,60,JX_9B10A1
+1715200000,boot,JX_9B10A1,JX_9B10A1,,5.8.1,30,5,60,JX_9B10A1
 ```
 
 ```
@@ -436,12 +494,20 @@ a multi-day soak.
 
 ### What this does NOT capture
 
-- No persistent crash log on the device. A field unit that crashes still
-  reboots clean; the RTT log is the only record. To persist a `fault` row to
-  JXS across reboots, a fault handler + retained-RAM scheme would be needed
-  (separate work).
+- No call-stack unwinding. The thread analyzer reports the high-water mark
+  on each thread but not the call chain that drove the stack pointer. RTT is
+  still the only place to see the stack-overrun sentinel (`0xAA`) directly.
 - No effect on production: the analyzer is a read-only walk; no NOR writes,
   no BLE radio interaction.
+
+### Persistent crash audit (post-recovery boot)
+
+Since the production-recovery boot branch landed, every silent reset emits a
+`wdt_recovery_{dog,sreq,lockup,no_rtc}` row to JXS on the next boot. A unit
+with N of these rows in a day is immediately visible to the gateway operator
+at offload — even if the operator never had RTT attached. Combine that with
+the `LOG_PANIC()` thread-name print from `wdt_warn_cb` for a complete picture
+of "who was running when the WDT tripped" + "did it recover".
 
 ---
 
@@ -472,12 +538,15 @@ applications/juxta5-8-prod/
 | Feature                     | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Shelf mode (System OFF)     | Fresh boot, brownout, Gateway `reset`, production magnet hold, DFU swipe → `prepare_for_shelf_mode()` (stop timers, disconnect BLE, LIS2DH12 power-down) then `sys_poweroff()`; MAG_INT `GPIO_INT_LEVEL_LOW` wake source                                                                                                                                                                                                                                                                                                                               |
-| Magnet hold measurement     | < 7 s → normal wake, ≥ 7 s → DFU path                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Magnet hold measurement     | Required 3 s debounce at every site; 3 s ≤ t < 10 s → normal wake; ≥ 10 s → DFU path; sub-3 s holds rejected as false positives at every magnet detection site (production loop, DFU exit monitor, post-System-OFF wake, debug-shelf simulation) |
 | LED mode state machine      | `OFF`, `ON` (connected), `SLOW_BLINK` (50/450 ms, datetime sync), `FAST_BLINK` (50/50 ms, DFU), `LONG_BLINK` (1 s / 1 s, NOR or LIS2DH12 init failure) driven by kernel timer + work item                                                                                                                                                                                                                                                                                                                                                              |
 | Hardware fault indication   | `juxta_log_init` or `init_accel` failure → RTT error + indefinite **long blink**; production not started                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | LED blink sequences         | Magnet hold: solid ON; DFU entry: 3× 200 ms blink; production init: 5× 50 ms blink                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Datetime sync gate          | Connectable adv after normal wake; loops indefinitely until timestamp received; must have timestamp before production init                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| Watchdog                    | 30 s window, fed every 10 s, pauses on debug halt                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Watchdog                    | 5 s window (`WDT_WINDOW_MS`), fed every 2 s (`WDT_FEED_PERIOD_MS`), pauses on debug halt; pre-warn callback (`wdt_warn_cb`) emits the last-running thread name + `thread_analyzer_print(0)` via `LOG_PANIC` so the cause of a silent hang lands in RTT before the reset |
+| Production recovery boot    | After a silent reset (`DOG`/`LOCKUP`/`SREQ`) with NVS `op_mode == PROD`, the firmware restores the RTC from a retained-RAM (`.noinit`) snapshot (magic + version + CRC32) and re-enters production without requiring a magnet or gateway re-sync. If the snapshot is invalid, falls through to datetime sync. Cold boot (`RESETREAS == 0`) still routes to shelf. A `wdt_recovery_{dog,sreq,lockup,no_rtc}` row is appended to JXS for audit |
+| Op-mode persistence         | NVS-backed one-byte key (separate from gateway settings blob) tracks last committed mode: `SHELF` (top of `enter_shelf_mode`), `DFU` (top of `enter_dfu_mode`), `PROD` (after `juxta_ble_set_production_ready()`). Gateway field updates do not rewrite this byte and vice-versa, minimising flash wear |
+| Retained-RAM RTC checkpoint | 1 s `k_timer` calls `juxta_time_retained_update()` from production; struct lives in `__noinit` section so it survives soft resets but is wiped by cold boot / System OFF. CRC32 + magic + version guard against partial writes |
 | NVS settings                | `subject_id`, `experiment`, `scan_interval_s`, `vitals_interval_s`, `adv_interval_s`, `inactivity_multiplier` **1–10** (plus `upload_path` slot always written as `**/**`; reserved bytes for legacy blob layout)                                                                                                                                                                                                                                                                                                                                    |
 | NOR CSV logging             | JXS events, JXV vitals, JXB BLE observations; append-only, `#EOF` on close                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Daily file rotation         | `ensure_file()` in `[src/juxta_log.c](src/juxta_log.c)`: when the calendar date from `unix_time` no longer matches the active pseudo-file, the previous file is closed with `#EOF` and a new `*yyyymmdd.csv` is created. On each new **calendar day**, the first JXS/JXV/JXB append runs `touch_all_for_calendar_day()` so **all three** types get a dated file for that day. **JXS** new-file creation auto-emits a `day_start` row (NVS snapshot via the existing JXS columns) so the day is self-describing; **JXV/JXB** stay strict CSV (header + data rows only). Requires a valid clock; old files remain until Gateway `clearMemory`. **File-creation guarantee**: any JXS event with a valid clock (the first row written after a sync-gate is the auto-emitted `day_start`, immediately followed by `shelf_exit`) calls `touch_all_for_calendar_day` and creates JXS/JXV/JXB for today; rows logged with `unix_time == 0` are silently dropped. The `boot` row therefore always lands in an existing JXS file |
@@ -494,7 +563,7 @@ applications/juxta5-8-prod/
 | Debugger simulation loop    | `CoreDebug->DHCSR` detects J-Link; simulates shelf/wake/DFU cycle in-band; `sys_reboot()` restarts loop                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | Vitals logging              | LIS2DH12 temperature, SAADC battery voltage, motion count → JXV; motion snapshot also drives inactivity **scan** interval multiplier                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | BLE observation logging     | `JX_XXXXXX` peer detection → JXB rows with observer/peer/rssi                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| JXS provenance rows         | `day_start`, `shelf_exit`, `user_connected`, `time_set`, `user_disconnected`, `boot`, `shelf_entry`, `settings_changed`, `memory_cleared`, `low_battery` — together these read as a chronological device lifecycle: every new JXS pseudo-file opens with a `day_start` row (current NVS snapshot); each magnet wake produces a `shelf_exit`; each real BLE session is bracketed by `user_connected` / `user_disconnected`; each operator-initiated shelf return writes `shelf_entry` before power-off. `time_set` is written every time the gateway supplies a clock value (e.g. once per sync-gate session) |
+| JXS provenance rows         | `day_start`, `shelf_exit`, `user_connected`, `time_set`, `user_disconnected`, `boot`, `shelf_entry`, `settings_changed`, `memory_cleared`, `low_battery`, `wdt_recovery_dog`, `wdt_recovery_sreq`, `wdt_recovery_lockup`, `wdt_recovery_no_rtc` — together these read as a chronological device lifecycle: every new JXS pseudo-file opens with a `day_start` row (current NVS snapshot); each magnet wake produces a `shelf_exit`; each real BLE session is bracketed by `user_connected` / `user_disconnected`; each operator-initiated shelf return writes `shelf_entry` before power-off; each silent-reset recovery emits one `wdt_recovery_*` row right after `boot`. `time_set` is written every time the gateway supplies a clock value (e.g. once per sync-gate session) |
 | File listing wire format    | `name\|size;name\|size;…` indication; listing **size** is CSV payload only (no filename line, no `#EOF`); transfer ends with 3-byte `EOF` indication on File Transfer                                                                                                                                                                                                                                                                                                                                                                                |
 | Day-start provenance        | Every new JXS pseudo-file leads with a `day_start` row (current NVS settings via the standard JXS columns: subject, experiment, intervals, ble_name). JXV/JXB stay strict CSV (header + data rows). Replaces the previous `#device_settings` JXV comment lines that broke single-header CSV parsing                                                                                                                                                                                                                                                       |
 | FUEL pin correction         | FUEL on P0.30/AIN6 (was incorrectly mapped to P0.28/AIN4 = AXY_INT2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |

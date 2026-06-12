@@ -4,11 +4,14 @@
  * Boot sequence:
  *   Fresh power-on (RESETREAS == 0) → System OFF (shelf mode), no LED.
  *   System OFF wake (RESETREAS[OFF]) → LED ON while magnet held:
- *     < 7 s  → slow blink (50 ms ON / 450 ms OFF) → connectable adv + datetime sync
- *              → must receive timestamp before entering production
- *     ≥ 7 s  → 3× blink, then fast blink (50/50 ms) → DFU mode (SMP BLE)
- *              → 5 s debounce, then magnet swipe returns to shelf
- *   Other reset (watchdog / pin / lockup) → straight to production, no LED gate.
+ *     < 3 s          → rejected as a false positive, back to shelf (no action)
+ *     3 s ≤ t < 10 s → LED off at 3 s as commit cue → slow blink (50/450 ms)
+ *                      → connectable adv + datetime sync (must receive timestamp)
+ *     ≥ 10 s         → LED off at 3 s → 3× blink → fast blink (50/50 ms) → DFU
+ *                      → 5 s debounce, then a confirmed 3 s magnet hold returns to shelf
+ *   Silent reset (DOG/LOCKUP/SREQ) + op_mode == PROD → production recovery
+ *     (RTC restored from retained RAM, JXS wdt_recovery_* row).
+ *   Other reset (cold without OFF wake) → shelf mode.
  *
  * Connected state: LED solid ON.
  * Sync success + disconnect: 5× blink, LED off, then production init.
@@ -222,6 +225,12 @@ static const struct device *wdt;
 static int wdt_channel_id = -1;
 static struct k_timer wdt_feed_timer;
 
+/* RTC checkpoint timer — refreshes the retained-RAM snapshot once per second
+ * so the production recovery boot branch can restore the clock to within
+ * ≤1 s of the moment the WDT/LOCKUP/SREQ fault occurred.  Started from main()
+ * immediately after juxta_ble_set_production_ready(); see juxta_time.c. */
+static struct k_timer rtc_checkpoint_timer;
+
 #define WDT_WINDOW_MS 5000U
 #define WDT_FEED_PERIOD_MS 2000U
 
@@ -254,6 +263,15 @@ static void wdt_feed_timer_cb(struct k_timer *timer)
 	{
 		(void)wdt_feed(wdt, wdt_channel_id);
 	}
+}
+
+static void rtc_checkpoint_cb(struct k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	/* Cheap: a handful of RAM writes + a CRC32 over ~24 bytes.  Safe in
+	 * timer context — juxta_time_now() is lock-free (atomic) and
+	 * juxta_time_retained_update() touches only the .noinit struct. */
+	juxta_time_retained_update();
 }
 
 /* Also call from long paths (NOR append burst, BLE state machine) so a blocked
@@ -354,6 +372,13 @@ static void enter_shelf_mode(void)
 {
 	bool debug = (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0U;
 
+	/* Persist op_mode := SHELF *before* the soft reboot / sys_poweroff() so a
+	 * later silent reset can never mistake this unit for one that was running
+	 * production.  Retained RAM is invalidated for the same reason: a clean
+	 * shelf entry must not look like a recoverable production boot. */
+	(void)juxta_settings_set_op_mode(JUXTA_OP_MODE_SHELF);
+	juxta_time_retained_invalidate();
+
 	k_sleep(K_MSEC(30)); /* flush RTT */
 
 	if (debug)
@@ -393,20 +418,49 @@ static void enter_shelf_mode(void)
 /* ---------------------------------------------------------------------------
  * Boot magnet hold measurement
  *
- * LED is turned ON before calling this so the user sees confirmation that
- * the magnet wake was detected. LED stays ON for the full hold duration.
+ * At the boot-wake call sites the caller turns the LED ON before this runs
+ * so the user gets immediate visual confirmation the magnet was detected.
+ * The optional `led_off_at_debounce` parameter then drives the LED low the
+ * moment the hold crosses MAGNET_DEBOUNCE_MS, giving the user a tactile cue
+ * that "the gesture is committed — you can release now (or keep holding for
+ * DFU)".  Pass `false` from callers where the LED is owned by a higher
+ * layer (state machine, LED_MODE_FAST_BLINK), so this helper never fights
+ * for the GPIO line.
  * -------------------------------------------------------------------------*/
-#define DFU_HOLD_THRESHOLD_MS 7000U
+/* Magnet timing constants.
+ *
+ * MAGNET_DEBOUNCE_MS — minimum continuous hold required for ANY magnet
+ * action to be honoured.  Sub-debounce holds are treated as false
+ * positives (transient brush, RFID reader, motor flyback, etc.) and the
+ * device remains in its current mode without any state change.  This
+ * guards every magnet-detection site in this file.
+ *
+ * DFU_HOLD_THRESHOLD_MS — long hold that selects DFU instead of normal
+ * shelf wake / datetime sync.  Raised from 7 s to 10 s so it sits well
+ * past the 3 s debounce floor and is unambiguous when the user holds
+ * deliberately. */
+#define MAGNET_DEBOUNCE_MS 3000U
+#define DFU_HOLD_THRESHOLD_MS 10000U
 
-static int64_t measure_magnet_hold(void)
+static int64_t measure_magnet_hold(bool led_off_at_debounce)
 {
 	int64_t t0 = k_uptime_get();
+	bool led_dropped = false;
 
 	/* gpio_pin_get_dt returns non-zero while magnet is active (present) */
 	while (gpio_pin_get_dt(&magnet) != 0)
 	{
 		k_sleep(K_MSEC(50));
-		if (k_uptime_get() - t0 >= (int64_t)DFU_HOLD_THRESHOLD_MS)
+		int64_t elapsed = k_uptime_get() - t0;
+
+		if (led_off_at_debounce && !led_dropped &&
+			elapsed >= (int64_t)MAGNET_DEBOUNCE_MS)
+		{
+			gpio_pin_set_dt(&led, 0);
+			led_dropped = true;
+		}
+
+		if (elapsed >= (int64_t)DFU_HOLD_THRESHOLD_MS)
 		{
 			break;
 		}
@@ -432,6 +486,12 @@ static int start_dfu_adv(void);
  * -------------------------------------------------------------------------*/
 static void enter_dfu_mode(void)
 {
+	/* Persist op_mode := DFU at the top so any silent reset during the DFU
+	 * monitor (watchdog, MCUboot reboot, stack fault) is correctly classified
+	 * as a DFU event by the recovery branch — which only restores production
+	 * when op_mode == PROD. */
+	(void)juxta_settings_set_op_mode(JUXTA_OP_MODE_DFU);
+
 	/* 3 entry blinks */
 	led_blink(3U, 200U, 200U);
 
@@ -471,12 +531,28 @@ static void enter_dfu_mode(void)
 	k_sleep(K_SECONDS(5));
 
 	/* Monitor for another magnet swipe to return to shelf */
-	LOG_INF("DFU: debounce done — magnet swipe will return to shelf");
+	LOG_INF("DFU: debounce done — hold magnet ≥%u ms to return to shelf",
+			MAGNET_DEBOUNCE_MS);
 	for (;;)
 	{
 		if (gpio_pin_get_dt(&magnet) != 0)
 		{
-			LOG_INF("DFU: magnet re-applied — returning to shelf");
+			/* Confirm a real, continuous hold before tearing down DFU.
+			 * measure_magnet_hold() returns when the magnet is released
+			 * or DFU_HOLD_THRESHOLD_MS elapses, so this blocks for at
+			 * most ~10 s.  No commit cue here: LED_MODE_FAST_BLINK owns
+			 * the LED so any one-shot drive we issued would be immediately
+			 * overwritten by the next blink edge anyway. */
+			int64_t hold_ms = measure_magnet_hold(false);
+			if (hold_ms < (int64_t)MAGNET_DEBOUNCE_MS)
+			{
+				LOG_INF("DFU magnet false positive (%lld ms < %u ms) — staying in DFU",
+						(long long)hold_ms, MAGNET_DEBOUNCE_MS);
+				continue;
+			}
+
+			LOG_INF("DFU: magnet held %lld ms — returning to shelf",
+					(long long)hold_ms);
 			set_led_mode(LED_MODE_OFF);
 			(void)bt_le_adv_stop();
 			k_sleep(K_MSEC(20));
@@ -877,6 +953,12 @@ static int start_nonconn_adv(void)
 		BT_DATA(BT_DATA_NAME_COMPLETE, adv_name, strlen(adv_name)),
 	};
 	int rc = bt_le_adv_start(&adv_param, nc_adv, ARRAY_SIZE(nc_adv), NULL, 0);
+	/* Per-burst trace logs are LOG_DBG: they fire at adv_interval_s /
+	 * scan_interval_s (5 s / 30 s by default).  With CONFIG_LOG_MODE_IMMEDIATE,
+	 * INF-level emits here drove a heavy synchronous trip through
+	 * z_log_msg_commit every few seconds and dominated RTT noise.  Promote
+	 * the module to LOG_LEVEL_DBG when actively debugging the radio
+	 * scheduler to see these lines again. */
 
 	if (rc != 0)
 	{
@@ -884,7 +966,7 @@ static int start_nonconn_adv(void)
 	}
 	else
 	{
-		LOG_INF("Advertising as %s", adv_name);
+		LOG_DBG("Advertising as %s", adv_name);
 	}
 	return rc;
 }
@@ -909,7 +991,7 @@ static int start_scanning(void)
 	}
 	else
 	{
-		LOG_INF("Scanning started");
+		LOG_DBG("Scanning started");
 	}
 	return rc;
 }
@@ -1043,7 +1125,7 @@ static void process_scan_events(void)
 /* ---------------------------------------------------------------------------
  * Operational state machine
  * -------------------------------------------------------------------------*/
-#define ADV_BURST_MS 1000U /* Non-connectable adv burst wall time (state_timer) */
+#define ADV_BURST_MS 1000U	/* Non-connectable adv burst wall time (state_timer) */
 #define SCAN_BURST_MS 1000U /* Passive scan burst wall time (state_timer) */
 #if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
 #define GATEWAY_ADV_MS 30000U
@@ -1432,8 +1514,22 @@ int main(void)
 	bool fresh_boot = (resetreas == 0U);
 	bool need_datetime_sync = false;
 
-	LOG_INF("Boot: RESETREAS=0x%08x system_off=%d fresh=%d debugger=%d",
-			resetreas, (int)from_system_off, (int)fresh_boot, (int)debugger_active);
+	/* Production recovery flags — populated below in Step 7 once
+	 * juxta_settings_init() has loaded NVS op_mode.  Computed here so the
+	 * boot-decision branch's fresh_boot / from_system_off / debugger_active
+	 * arms can short-circuit cleanly without forward-declaring locals. */
+	bool is_silent_reset =
+		(resetreas & (POWER_RESETREAS_DOG_Msk | POWER_RESETREAS_LOCKUP_Msk |
+					  POWER_RESETREAS_SREQ_Msk)) != 0U &&
+		!from_system_off && !fresh_boot;
+	bool recovery_attempted = false;
+	bool recovery_full = false;
+	uint32_t recovery_unix = 0U;
+	const char *recovery_event = NULL;
+
+	LOG_INF("Boot: RESETREAS=0x%08x system_off=%d fresh=%d debugger=%d silent_reset=%d",
+			resetreas, (int)from_system_off, (int)fresh_boot, (int)debugger_active,
+			(int)is_silent_reset);
 
 	if (debugger_active)
 	{
@@ -1449,18 +1545,37 @@ int main(void)
 		LOG_INF("[DBG] Simulated shelf mode — apply magnet to wake");
 		set_led_mode(LED_MODE_OFF);
 
-		while (gpio_pin_get_dt(&magnet) == 0)
+		/* Outer loop: re-arm and wait again on every false-positive hold.
+		 * Breaks out (via fallthrough) only when a confirmed >= MAGNET_DEBOUNCE_MS
+		 * hold is observed; DFU entry / shelf-mode-from-DFU never return. */
+		int64_t hold_ms = 0;
+		for (;;)
 		{
-			k_sleep(K_MSEC(50));
+			while (gpio_pin_get_dt(&magnet) == 0)
+			{
+				k_sleep(K_MSEC(50));
+			}
+
+			LOG_INF("[DBG] Magnet applied — measuring hold");
+			gpio_pin_set_dt(&led, 1);
+
+			/* led_off_at_debounce=true: the moment the hold crosses 3 s
+			 * the LED drops as a "commit confirmed" cue.  DFU entry (≥10 s)
+			 * lights the LED back up via the 3× blink + fast blink. */
+			hold_ms = measure_magnet_hold(true);
+
+			LOG_INF("[DBG] Magnet hold: %lld ms (debounce: %u ms, DFU: %u ms)",
+					(long long)hold_ms, MAGNET_DEBOUNCE_MS, DFU_HOLD_THRESHOLD_MS);
+
+			if (hold_ms < (int64_t)MAGNET_DEBOUNCE_MS)
+			{
+				LOG_INF("[DBG] Magnet hold %lld ms < %u ms — false positive, back to shelf",
+						(long long)hold_ms, MAGNET_DEBOUNCE_MS);
+				gpio_pin_set_dt(&led, 0);
+				continue;
+			}
+			break;
 		}
-
-		LOG_INF("[DBG] Magnet applied — measuring hold");
-		gpio_pin_set_dt(&led, 1);
-
-		int64_t hold_ms = measure_magnet_hold();
-
-		LOG_INF("[DBG] Magnet hold: %lld ms (DFU threshold: %u ms)",
-				(long long)hold_ms, DFU_HOLD_THRESHOLD_MS);
 
 		if (hold_ms >= (int64_t)DFU_HOLD_THRESHOLD_MS)
 		{
@@ -1497,11 +1612,27 @@ int main(void)
 		{
 			gpio_pin_set_dt(&led, 1);
 
-			int64_t hold_ms = measure_magnet_hold();
+			/* led_off_at_debounce=true: same commit-confirmed cue as the
+			 * debug-shelf path.  The user sees the LED go dark the instant
+			 * the 3 s threshold is crossed and may release; DFU entry will
+			 * re-light it via the 3× blink + fast blink. */
+			int64_t hold_ms = measure_magnet_hold(true);
 
-			LOG_INF("Magnet hold: %lld ms", (long long)hold_ms);
+			LOG_INF("Magnet hold: %lld ms (debounce: %u ms, DFU: %u ms)",
+					(long long)hold_ms, MAGNET_DEBOUNCE_MS, DFU_HOLD_THRESHOLD_MS);
 
-			if (hold_ms >= (int64_t)DFU_HOLD_THRESHOLD_MS)
+			if (hold_ms < (int64_t)MAGNET_DEBOUNCE_MS)
+			{
+				/* Sub-debounce wake — never commit to production or DFU
+				 * from a stray field.  enter_shelf_mode() re-arms the
+				 * System OFF + magnet wake exactly as on a clean shelf
+				 * entry. */
+				LOG_INF("Magnet hold %lld ms < %u ms — false positive, returning to shelf",
+						(long long)hold_ms, MAGNET_DEBOUNCE_MS);
+				gpio_pin_set_dt(&led, 0);
+				enter_shelf_mode(); /* does not return */
+			}
+			else if (hold_ms >= (int64_t)DFU_HOLD_THRESHOLD_MS)
 			{
 				if (g_batt_mv > 0U && g_batt_mv < BATT_DFU_MIN_MV)
 				{
@@ -1553,12 +1684,58 @@ int main(void)
 
 	/* ----------------------------------------------------------------
 	 * Step 7: Internal flash settings + NOR log + BLE service
+	 *
+	 * juxta_settings_init() is what populates the NVS-backed op_mode that
+	 * the recovery decision below reads, so the recovery branch sits
+	 * between settings init and juxta_log_init().  juxta_log_init() can
+	 * then run with the recovered RTC, so today's JXS/JXV/JXB files exist
+	 * for the boot + wdt_recovery_* rows further down.
 	 * -------------------------------------------------------------- */
 	rc = juxta_settings_init(device_id);
 	if (rc != 0)
 	{
 		LOG_ERR("Settings init failed: %d", rc);
 		return rc;
+	}
+
+	/* Production recovery boot decision.  Conditions:
+	 *   (a) a silent reset bit is set in RESETREAS (DOG / LOCKUP / SREQ), AND
+	 *   (b) the boot path is neither a cold boot nor a System OFF wake, AND
+	 *   (c) NVS op_mode == PROD (DFU / shelf silent resets fall through to
+	 *       the existing post-reset flow untouched), AND
+	 *   (d) the debugger is not attached (debug shelf simulation preserved).
+	 *
+	 * On a valid retained-RAM snapshot we restore the RTC right here so
+	 * juxta_log_init() and every subsequent log append carries the real
+	 * wall-clock time.  On an invalid snapshot we set need_datetime_sync so
+	 * the unit gathers a fresh clock from the gateway in Step 8. */
+	{
+		enum juxta_op_mode saved_mode = juxta_settings_get_op_mode();
+
+		if (is_silent_reset && saved_mode == JUXTA_OP_MODE_PROD && !debugger_active)
+		{
+			recovery_attempted = true;
+			if (juxta_time_retained_valid())
+			{
+				recovery_unix = juxta_time_retained_unix();
+				recovery_full = true;
+				recovery_event = (resetreas & POWER_RESETREAS_DOG_Msk)		? "wdt_recovery_dog"
+								 : (resetreas & POWER_RESETREAS_LOCKUP_Msk) ? "wdt_recovery_lockup"
+																			: "wdt_recovery_sreq";
+				juxta_time_set(recovery_unix);
+				LOG_INF("Recovery: RTC restored from retained RAM (unix=%u, event=%s)",
+						(unsigned)recovery_unix, recovery_event);
+			}
+			else
+			{
+				recovery_event = "wdt_recovery_no_rtc";
+				need_datetime_sync = true;
+				LOG_WRN("Recovery: retained RAM invalid — forcing datetime_sync");
+			}
+		}
+		LOG_INF("Recovery: op_mode=%u silent=%d attempted=%d full=%d",
+				(unsigned)saved_mode, (int)is_silent_reset,
+				(int)recovery_attempted, (int)recovery_full);
 	}
 
 	rc = juxta_log_init(&log_ctx, juxta_settings_get(), device_id);
@@ -1600,10 +1777,33 @@ int main(void)
 	hardware_ready = true;
 	juxta_ble_set_production_ready();
 
+	/* Persist op_mode := PROD only after hardware is ready and BLE is
+	 * fully wired up.  A failure before this point cleanly leaves the unit
+	 * in its previous mode (SHELF or DFU), which is the desired
+	 * fallback. */
+	(void)juxta_settings_set_op_mode(JUXTA_OP_MODE_PROD);
+
+	/* Start the 1 s retained-RAM RTC checkpoint.  Begins firing
+	 * immediately so any silent reset within the first second of
+	 * production still has a snapshot available (although the snapshot
+	 * is only meaningful once juxta_time_now() > 0). */
+	k_timer_init(&rtc_checkpoint_timer, rtc_checkpoint_cb, NULL);
+	k_timer_start(&rtc_checkpoint_timer, K_SECONDS(1), K_SECONDS(1));
+
 	/* "boot" is the first NOR write — creates JXS for today's date.
 	 * Skipped silently if clock is still unset (ensure_file returns 0 for time == 0). */
 	(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
 								 "boot", juxta_time_now());
+
+	/* Auditable recovery trail: a wdt_recovery_{dog,sreq,lockup,no_rtc} row
+	 * lands in JXS immediately after "boot" whenever the recovery branch
+	 * fired.  A unit with N of these rows in a day is immediately visible
+	 * to the gateway operator at the next offload. */
+	if (recovery_event != NULL)
+	{
+		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
+									 recovery_event, juxta_time_now());
+	}
 
 	k_work_init(&state_work, state_work_handler);
 	k_work_init(&vitals_work, vitals_work_handler);
@@ -1621,32 +1821,59 @@ int main(void)
 	LOG_INF("Production init complete: %s fw=%s", device_id, JUXTA_FIRMWARE_VERSION);
 
 	/* Production magnet monitor: check every 500 ms when not connected.
-	 * Holding the magnet triggers 5× blink → 5 s debounce → shelf mode.
-	 * The 5 s window lets the user remove the magnet before poweroff.
-	 * Ignored while iOS is connected so an accidental touch doesn't abort a session. */
+	 * On magnet sample, confirm a continuous >= MAGNET_DEBOUNCE_MS hold
+	 * (measure_magnet_hold blocks for up to ~DFU_HOLD_THRESHOLD_MS) before
+	 * tearing down production.  Sub-debounce blips are explicitly rejected
+	 * so a transient magnetic field never costs the user a session.
+	 * Ignored while iOS is connected so an accidental touch doesn't abort
+	 * a session. */
 	for (;;)
 	{
 		k_sleep(K_MSEC(500));
 
-		if (!ble_connected && gpio_pin_get_dt(&magnet) != 0)
+		if (ble_connected || gpio_pin_get_dt(&magnet) == 0)
 		{
-			LOG_INF("Magnet detected — 5 blinks, then shelf mode in 5 s");
-
-			/* Stop radio before visual sequence so state machine
-			 * doesn't restart advertising during the countdown. */
-			(void)bt_le_adv_stop();
-			(void)bt_le_scan_stop();
-			ble_state = BLE_STATE_IDLE;
-
-			led_blink(5U, 50U, 100U);
-
-			LOG_INF("Remove magnet — entering shelf mode");
-			(void)juxta_log_append_event(&log_ctx, juxta_settings_get(),
-										 device_id, "shelf_entry",
-										 juxta_time_now());
-			k_sleep(K_SECONDS(5));
-			enter_shelf_mode(); /* does not return */
+			continue;
 		}
+
+		/* Commit-pending cue: light the LED solid ON the instant the magnet
+		 * is detected, then let measure_magnet_hold(true) drop it at 3 s.
+		 * Safe to drive the GPIO directly here — when !ble_connected the LED
+		 * state machine is in LED_MODE_OFF with its timer not re-armed
+		 * (see on_disconnected), so no one else is touching the line. The
+		 * cue gives the user the same "release-now-or-keep-holding-for-DFU
+		 * commit confirmed" feedback as the boot-wake sites; here it means
+		 * "release now and you'll go into shelf, ready for the gateway
+		 * advertising magnet swipe at the next wake." */
+		gpio_pin_set_dt(&led, 1);
+		int64_t hold_ms = measure_magnet_hold(true);
+		if (hold_ms < (int64_t)MAGNET_DEBOUNCE_MS)
+		{
+			/* Sub-debounce hold: LED was never dropped by measure_magnet_hold
+			 * (we never crossed 3 s), so explicitly turn it off now. */
+			gpio_pin_set_dt(&led, 0);
+			LOG_INF("Production magnet false positive (%lld ms < %u ms) — staying in prod",
+					(long long)hold_ms, MAGNET_DEBOUNCE_MS);
+			continue;
+		}
+
+		LOG_INF("Magnet held %lld ms — 5 blinks, then shelf mode in 5 s",
+				(long long)hold_ms);
+
+		/* Stop radio before visual sequence so state machine
+		 * doesn't restart advertising during the countdown. */
+		(void)bt_le_adv_stop();
+		(void)bt_le_scan_stop();
+		ble_state = BLE_STATE_IDLE;
+
+		led_blink(5U, 50U, 100U);
+
+		LOG_INF("Remove magnet — entering shelf mode");
+		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(),
+									 device_id, "shelf_entry",
+									 juxta_time_now());
+		k_sleep(K_SECONDS(5));
+		enter_shelf_mode(); /* does not return */
 	}
 
 	return 0;

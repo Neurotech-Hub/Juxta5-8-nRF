@@ -305,41 +305,75 @@ static int read_line(struct juxta_log_context *ctx, uint32_t off, uint32_t end, 
 static int find_eof_or_erased(struct juxta_log_context *ctx, uint32_t off, uint32_t end,
 							  uint32_t *file_end, bool *closed)
 {
+	/* Chunked scan.  The previous implementation issued one flash_read() per
+	 * byte, which on nRF52840 SPI NOR is ~40-60 µs per call (CS toggle +
+	 * cmd + 24-bit address + 1 byte data).  For a single day of vitals
+	 * (~36 KB per active file × 3 files) that cost ~5 s of boot time.
+	 *
+	 * Reading in 256-byte pages cuts the SPI overhead by ~256× because the
+	 * address and command phases happen once per chunk instead of once per
+	 * byte.  The inner per-byte loop is byte-for-byte the same logic as
+	 * before, with one important invariant preserved: `matched` carries
+	 * the partial-EOF-marker match count across chunk boundaries.  That
+	 * is the only correctness-critical state when a marker straddles a
+	 * 256-byte boundary; everything else is local to one chunk.
+	 *
+	 * Static buffer (same pattern as first_erased_offset): keeps the 256 B
+	 * off thread stacks.  Safe because find_eof_or_erased is only called
+	 * from the main thread during boot init (recover_region and the
+	 * juxta_log_init cache-reconcile pass).  Both are single-threaded,
+	 * sequential, and complete before app timers / work queues start. */
+	static uint8_t buf[256];
 	const char marker[] = EOF_MARKER;
+	const size_t marker_len = strlen(marker);
 	size_t matched = 0;
 
 	while (off < end)
 	{
-		uint8_t ch;
-		int rc = flash_read_u8(ctx, off, &ch);
+		size_t len = MIN(sizeof(buf), end - off);
+		int rc = flash_read(ctx->flash, off, buf, len);
 
 		if (rc != 0)
 		{
 			return rc;
 		}
-		if (ch == 0xFFU)
-		{
-			*file_end = off;
-			*closed = false;
-			return 0;
-		}
 
-		if (ch == (uint8_t)marker[matched])
+		for (size_t i = 0; i < len; i++)
 		{
-			matched++;
-			if (matched == strlen(marker))
+			uint8_t ch = buf[i];
+
+			if (ch == 0xFFU)
 			{
-				*file_end = off + 1U;
-				*closed = true;
+				/* Erased byte = end of written region.  No byte of
+				 * EOF_MARKER ("#EOF\n") is 0xFF, so a partial match
+				 * cannot extend through 0xFF — safe to bail here
+				 * regardless of `matched`. */
+				*file_end = off + i;
+				*closed = false;
 				return 0;
 			}
-		}
-		else
-		{
-			matched = (ch == (uint8_t)marker[0]) ? 1U : 0U;
+
+			if (ch == (uint8_t)marker[matched])
+			{
+				matched++;
+				if (matched == marker_len)
+				{
+					*file_end = off + i + 1U;
+					*closed = true;
+					return 0;
+				}
+			}
+			else
+			{
+				/* Mismatch.  If the current byte happens to be the
+				 * marker's first character we still have a 1-byte
+				 * partial match — same fallback the single-byte
+				 * implementation used. */
+				matched = (ch == (uint8_t)marker[0]) ? 1U : 0U;
+			}
 		}
 
-		off++;
+		off += len;
 	}
 
 	*file_end = end;
@@ -696,12 +730,15 @@ int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *s
 		LOG_INF("Loaded %u cached NOR CSV pseudo-files", ctx->file_count);
 
 		/* The NVS cache stores the file length only at file
-		 * creation/rotation — never on individual row appends.  After a
-		 * reboot on the same calendar day the cached length points back
-		 * to the header, and append_row would write at that stale offset
-		 * (into already-written NOR bytes that are silently ignored).
-		 * Scan each active file with find_eof_or_erased so entry->length
-		 * reflects every row that was written in previous sessions. */
+		 * creation/rotation — never on individual row appends (NVS wear:
+		 * see comment in append_row).  After a reboot on the same calendar
+		 * day the cached length points back to the header, and append_row
+		 * would write at that stale offset (into already-written NOR bytes
+		 * that are silently ignored).  Scan each active file with
+		 * find_eof_or_erased to reconcile entry->length with every row
+		 * that was written in previous sessions.  The scan is fast (~30 ms
+		 * per 36 KB file) thanks to the 256-byte chunked read inside
+		 * find_eof_or_erased — see the comment there. */
 		for (uint16_t i = 0; i < ctx->file_count; i++)
 		{
 			struct juxta_file_entry *e = &ctx->files[i];

@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define JUXTA_PRODUCT_NAME "Juxta5-8"
-#define JUXTA_FIRMWARE_VERSION "5.8.0"
+#define JUXTA_FIRMWARE_VERSION "5.8.1"
 #define JUXTA_LOG_SCHEMA "jxta-nor-csv-v5"
 #define JUXTA_LOGGING_VERSION 5
 
@@ -40,5 +40,16 @@
 /* 3 log types × up to 5 days before clearMemory = 15; keep at 16 for headroom. */
 #define JUXTA_MAX_FILES 16
 #define JUXTA_TRANSFER_CHUNK_SIZE 512
+
+/* Persisted operating mode (NVS-backed; see juxta_settings_get_op_mode /
+ * juxta_settings_set_op_mode).  The recovery-on-silent-reset boot branch in
+ * main.c only attempts to resume production when this is PROD, so DFU- and
+ * shelf-mode units never accidentally fall into the recovery path. */
+enum juxta_op_mode
+{
+	JUXTA_OP_MODE_SHELF = 0, /* default — power-on, shelf, after magnet/gateway-driven exit */
+	JUXTA_OP_MODE_PROD = 1,	 /* production init completed; recovery target */
+	JUXTA_OP_MODE_DFU = 2,	 /* DFU mode entered */
+};
 
 #endif /* JUXTA_PROD_H_ */

@@ -310,6 +310,10 @@ shelf_entry
 settings_changed
 memory_cleared
 low_battery
+wdt_recovery_dog
+wdt_recovery_sreq
+wdt_recovery_lockup
+wdt_recovery_no_rtc
 reset
 mode_changed
 subject_changed
@@ -334,10 +338,24 @@ shelf-wake → retrieve → production → magnet-shelf cycle:
 - `boot` — production init complete (timers and BLE state machine starting).
 - `shelf_entry` — operator held the magnet during production to enter shelf
   mode; written immediately before `enter_shelf_mode()`.
+- `wdt_recovery_dog` / `wdt_recovery_sreq` / `wdt_recovery_lockup` — emitted
+  immediately after `boot` when the production recovery branch fired with a
+  valid retained-RAM RTC snapshot. The suffix matches the bit observed in
+  `RESETREAS` (watchdog `DOG`, soft `SREQ` reboot, or CPU `LOCKUP`). The
+  device skipped the magnet/gateway sync gate and resumed production
+  automatically with `op_mode == PROD` confirmed in NVS.
+- `wdt_recovery_no_rtc` — same recovery branch but the retained-RAM snapshot
+  was invalid (cold-boot wipe, partial write, CRC mismatch). The device
+  fell through to datetime sync and gathered a fresh clock from the gateway
+  before re-entering production. Useful as a "I did recover but the RTC was
+  lost" marker for downstream analysis.
 
 This separates the two distinct "device left the radio" reasons that previously
 both wrote `user_disconnected`: a real BLE disconnect (`user_disconnected`)
-vs. an operator-initiated magnet shelf (`shelf_entry`).
+vs. an operator-initiated magnet shelf (`shelf_entry`).  The four
+`wdt_recovery_*` events extend that audit trail across silent resets — a
+unit with several `wdt_recovery_dog` rows in a day is immediately visible
+at offload even if RTT was never attached.
 
 ## Subject ID Rules
 

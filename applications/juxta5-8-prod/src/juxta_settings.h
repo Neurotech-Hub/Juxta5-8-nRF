@@ -46,4 +46,11 @@ int juxta_settings_load_log_cache(struct juxta_log_cache *cache);
 int juxta_settings_save_log_cache(const struct juxta_log_cache *cache);
 int juxta_settings_clear_log_cache(void);
 
+/* Persistent operating mode (NVS-backed, separate key from `current` so
+ * gateway field updates do not rewrite this byte and vice-versa).  Default
+ * value on a unit that has never written op_mode is SHELF, preserving the
+ * cold-boot-to-shelf invariant when retained RAM is also empty. */
+enum juxta_op_mode juxta_settings_get_op_mode(void);
+int juxta_settings_set_op_mode(enum juxta_op_mode mode);
+
 #endif /* JUXTA_SETTINGS_H_ */

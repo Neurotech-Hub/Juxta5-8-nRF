@@ -12,6 +12,7 @@ LOG_MODULE_REGISTER(juxta_settings, LOG_LEVEL_INF);
 #define SETTINGS_SUBTREE "juxta_prod"
 #define SETTINGS_KEY_CURRENT "current"
 #define SETTINGS_KEY_LOG_CACHE "log_cache"
+#define SETTINGS_KEY_OP_MODE "op_mode"
 #define LOG_CACHE_MAGIC 0x4A584C43U /* JXLC */
 #define LOG_CACHE_VERSION 1U
 
@@ -19,6 +20,9 @@ static struct juxta_settings current_settings;
 static struct juxta_log_cache current_log_cache;
 static bool loaded_settings;
 static bool loaded_log_cache;
+/* One-byte persisted operating mode (NVS).  Defaults to SHELF before any
+ * setter runs so the cold-boot / first-flash path naturally lands in shelf. */
+static uint8_t current_op_mode = (uint8_t)JUXTA_OP_MODE_SHELF;
 static char boot_device_id[JUXTA_DEVICE_ID_LEN];
 
 static void copy_string(char *dst, size_t dst_size, const char *src)
@@ -84,6 +88,37 @@ static int settings_set(const char *key, size_t len, settings_read_cb read_cb, v
 			loaded_log_cache = true;
 		}
 		return (rc >= 0) ? 0 : rc;
+	}
+
+	if (strcmp(key, SETTINGS_KEY_OP_MODE) == 0)
+	{
+		if (len != sizeof(current_op_mode))
+		{
+			LOG_WRN("Ignoring op_mode size %zu expected %zu", len,
+					sizeof(current_op_mode));
+			return -EINVAL;
+		}
+
+		uint8_t stored = 0U;
+		int rc = read_cb(cb_arg, &stored, sizeof(stored));
+		if (rc >= 0)
+		{
+			/* Sanitize: unknown values fall back to SHELF, which is the
+			 * safest default when we cannot trust the persisted byte. */
+			if (stored == (uint8_t)JUXTA_OP_MODE_PROD ||
+				stored == (uint8_t)JUXTA_OP_MODE_DFU ||
+				stored == (uint8_t)JUXTA_OP_MODE_SHELF)
+			{
+				current_op_mode = stored;
+			}
+			else
+			{
+				LOG_WRN("Unknown op_mode=%u in NVS, defaulting to SHELF", stored);
+				current_op_mode = (uint8_t)JUXTA_OP_MODE_SHELF;
+			}
+			return 0;
+		}
+		return rc;
 	}
 
 	return -ENOENT;
@@ -253,4 +288,41 @@ int juxta_settings_clear_log_cache(void)
 	memset(&current_log_cache, 0, sizeof(current_log_cache));
 	loaded_log_cache = false;
 	return settings_delete(SETTINGS_SUBTREE "/" SETTINGS_KEY_LOG_CACHE);
+}
+
+enum juxta_op_mode juxta_settings_get_op_mode(void)
+{
+	return (enum juxta_op_mode)current_op_mode;
+}
+
+int juxta_settings_set_op_mode(enum juxta_op_mode mode)
+{
+	uint8_t next = (uint8_t)mode;
+
+	/* Sanitize at the boundary so a bad argument cannot poison NVS. */
+	if (mode != JUXTA_OP_MODE_SHELF && mode != JUXTA_OP_MODE_PROD &&
+		mode != JUXTA_OP_MODE_DFU)
+	{
+		LOG_ERR("Refusing to save unknown op_mode=%u", next);
+		return -EINVAL;
+	}
+
+	/* Skip the write when value is unchanged: minimises NVS wear over the
+	 * many shelf-PROD-shelf cycles a unit goes through during testing. */
+	if (next == current_op_mode)
+	{
+		return 0;
+	}
+
+	int rc = settings_save_one(SETTINGS_SUBTREE "/" SETTINGS_KEY_OP_MODE, &next,
+							   sizeof(next));
+	if (rc != 0)
+	{
+		LOG_ERR("settings_save_one op_mode failed: %d", rc);
+		return rc;
+	}
+
+	current_op_mode = next;
+	LOG_INF("op_mode := %u", next);
+	return 0;
 }
