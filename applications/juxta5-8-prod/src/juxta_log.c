@@ -13,7 +13,10 @@
 
 #include "juxta_time.h"
 
-LOG_MODULE_REGISTER(juxta_log, LOG_LEVEL_INF);
+/* DIAGNOSTIC BUILD: LOG_LEVEL_DBG so the flash_append / append entry-exit
+ * brackets fire.  The module has no other LOG_DBG callsites, so raising the
+ * level only enables the new bug-hunt instrumentation. */
+LOG_MODULE_REGISTER(juxta_log, LOG_LEVEL_DBG);
 
 #define FLASH_NODE DT_ALIAS(spi_mem)
 
@@ -45,6 +48,11 @@ static const struct log_region regions[] = {
 
 /* YYYYMMDD for which all three log types have been aligned (see touch_all_for_calendar_day). */
 static char s_log_calendar_ymd[9];
+
+/* Cached device identifier, populated by juxta_log_init().  ensure_file() uses
+ * this to format the JXS `day_start` row on new-file creation without needing
+ * to thread device_id through every vitals/BLE-observation append. */
+static char s_device_id[JUXTA_DEVICE_ID_LEN];
 
 static const struct log_region *region_for_type(enum juxta_log_type type)
 {
@@ -149,6 +157,8 @@ static int flash_append(struct juxta_log_context *ctx, uint32_t off, const void 
 		wbs = 1U;
 	}
 
+	LOG_DBG("flash_append: enter off=0x%06x len=%u wbs=%u", off, (unsigned)len, (unsigned)wbs);
+
 	while (done < len)
 	{
 		size_t payload = MIN(len - done, sizeof(chunk));
@@ -163,15 +173,21 @@ static int flash_append(struct juxta_log_context *ctx, uint32_t off, const void 
 		memset(chunk, 0xFF, sizeof(chunk));
 		memcpy(chunk, src + done, payload);
 
+		LOG_DBG("flash_append: write enter off=0x%06x wlen=%u (chunk %u/%u)",
+				off + (uint32_t)done, (unsigned)write_len, (unsigned)done, (unsigned)len);
 		int rc = flash_write(ctx->flash, off + done, chunk, write_len);
+		LOG_DBG("flash_append: write exit rc=%d", rc);
 		if (rc != 0)
 		{
+			LOG_DBG("flash_append: exit rc=%d (early, after %u of %u)",
+					rc, (unsigned)done, (unsigned)len);
 			return rc;
 		}
 
 		done += payload;
 	}
 
+	LOG_DBG("flash_append: exit rc=0 (wrote %u)", (unsigned)len);
 	return 0;
 }
 
@@ -421,42 +437,50 @@ int juxta_log_recover_files(struct juxta_log_context *ctx)
 	return 0;
 }
 
-/* After a new JXV pseudo-file is created, record NVS settings so each daily file is
- * self-contained (no need to correlate with old JXS for subject/intervals). */
-static int append_jxv_settings_snapshot(struct juxta_log_context *ctx,
-					const struct juxta_settings *settings)
+/* On new JXS pseudo-file creation, emit a single `day_start` row carrying the
+ * current NVS snapshot via the JXS schema columns (subject_id, experiment,
+ * intervals, ble_name).  Keeps each day interpretable from JXS alone without
+ * pulling history from prior days, and preserves the strict CSV contract
+ * (single header, all data rows) that the previous JXV `#device_settings`
+ * comment lines broke. */
+static int append_jxs_day_start_row(struct juxta_log_context *ctx,
+				    const struct juxta_settings *settings,
+				    uint32_t unix_time)
 {
 	struct juxta_file_entry *entry;
-	static char block[JUXTA_SUBJECT_ID_LEN + JUXTA_EXPERIMENT_LEN + 120];
+	static char row[256];
 	int len;
 	int rc;
 
-	if (!ctx || !settings || ctx->active_jxv == UINT32_MAX || ctx->active_jxv >= ctx->file_count)
+	if (!ctx || !settings || ctx->active_jxs == UINT32_MAX ||
+	    ctx->active_jxs >= ctx->file_count)
 	{
 		return -EINVAL;
 	}
 
-	entry = &ctx->files[ctx->active_jxv];
-	if (entry->type != JUXTA_LOG_JXV)
+	/* Defensive: if the caller forgot to populate device_id at init, skip
+	 * the row rather than emit a malformed CSV. */
+	if (s_device_id[0] == '\0')
+	{
+		return 0;
+	}
+
+	entry = &ctx->files[ctx->active_jxs];
+	if (entry->type != JUXTA_LOG_JXS)
 	{
 		return -EINVAL;
 	}
 
-	len = snprintf(block, sizeof(block),
-		       "#device_settings,subject_id,experiment,scan_interval_s,adv_interval_s,"
-		       "vitals_interval_s,inactivity_multiplier\n"
-		       "#device_settings,%s,%s,%u,%u,%u,%u\n",
-		       settings->subject_id, settings->experiment,
-		       (unsigned)settings->scan_interval_s, (unsigned)settings->adv_interval_s,
-		       (unsigned)settings->vitals_interval_s,
-		       (unsigned)settings->inactivity_multiplier);
-	if (len < 0 || len >= (int)sizeof(block))
+	len = snprintf(row, sizeof(row), "%u,day_start,%s,%s,%s,%s,%u,%u,%u,%s\n",
+		       unix_time, s_device_id, settings->subject_id, settings->experiment,
+		       JUXTA_FIRMWARE_VERSION, settings->scan_interval_s,
+		       settings->adv_interval_s, settings->vitals_interval_s, s_device_id);
+	if (len < 0 || len >= (int)sizeof(row))
 	{
 		return -ENOSPC;
 	}
 
-	rc = flash_append(ctx, entry->offset + entry->length, block, (size_t)len);
-
+	rc = flash_append(ctx, entry->offset + entry->length, row, (size_t)len);
 	if (rc != 0)
 	{
 		return rc;
@@ -542,9 +566,9 @@ static int ensure_file(struct juxta_log_context *ctx, enum juxta_log_type type,
 		return rc;
 	}
 
-	if (type == JUXTA_LOG_JXV)
+	if (type == JUXTA_LOG_JXS)
 	{
-		rc = append_jxv_settings_snapshot(ctx, settings);
+		rc = append_jxs_day_start_row(ctx, settings, unix_time);
 		if (rc != 0)
 		{
 			return rc;
@@ -638,6 +662,16 @@ int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *s
 	if (!ctx || !settings)
 	{
 		return -EINVAL;
+	}
+
+	/* Cache device_id so ensure_file() can format the JXS `day_start` row
+	 * on new-file creation without a new parameter on the vitals/BLE-observation
+	 * append paths.  Tolerate a NULL device_id (defensive — the field is
+	 * blanked and the day_start row is skipped if it ever happens). */
+	s_device_id[0] = '\0';
+	if (device_id != NULL)
+	{
+		(void)snprintf(s_device_id, sizeof(s_device_id), "%s", device_id);
 	}
 
 	memset(ctx, 0, sizeof(*ctx));
@@ -830,15 +864,19 @@ int juxta_log_append_event(struct juxta_log_context *ctx, const struct juxta_set
 		return -EINVAL;
 	}
 
+	LOG_DBG("append_event: enter t=%u event=%s", unix_time, event);
+
 	int rc = touch_all_for_calendar_day(ctx, settings, unix_time);
 	if (rc != 0)
 	{
+		LOG_DBG("append_event: exit rc=%d (touch_all)", rc);
 		return rc;
 	}
 
 	rc = ensure_file(ctx, JUXTA_LOG_JXS, settings, unix_time);
 	if (rc != 0)
 	{
+		LOG_DBG("append_event: exit rc=%d (ensure_file)", rc);
 		return rc;
 	}
 
@@ -848,11 +886,14 @@ int juxta_log_append_event(struct juxta_log_context *ctx, const struct juxta_set
 					   settings->adv_interval_s, settings->vitals_interval_s, device_id);
 	if (len < 0 || len >= (int)sizeof(row))
 	{
+		LOG_DBG("append_event: exit rc=-ENOSPC (snprintf)");
 		return -ENOSPC;
 	}
 
 	LOG_INF("JXS[%u] %s", unix_time, event);
-	return append_row(ctx, JUXTA_LOG_JXS, row);
+	rc = append_row(ctx, JUXTA_LOG_JXS, row);
+	LOG_DBG("append_event: exit rc=%d", rc);
+	return rc;
 }
 
 int juxta_log_append_vitals(struct juxta_log_context *ctx, uint32_t unix_time, uint16_t motion,
@@ -868,15 +909,19 @@ int juxta_log_append_vitals(struct juxta_log_context *ctx, uint32_t unix_time, u
 		return -EINVAL;
 	}
 
+	LOG_DBG("append_vitals: enter t=%u motion=%u", unix_time, motion);
+
 	int rc = touch_all_for_calendar_day(ctx, juxta_settings_get(), unix_time);
 	if (rc != 0)
 	{
+		LOG_DBG("append_vitals: exit rc=%d (touch_all)", rc);
 		return rc;
 	}
 
 	rc = ensure_file(ctx, JUXTA_LOG_JXV, juxta_settings_get(), unix_time);
 	if (rc != 0)
 	{
+		LOG_DBG("append_vitals: exit rc=%d (ensure_file)", rc);
 		return rc;
 	}
 
@@ -884,12 +929,15 @@ int juxta_log_append_vitals(struct juxta_log_context *ctx, uint32_t unix_time, u
 				   centivolts, temp_c);
 	if (len < 0 || len >= (int)sizeof(row))
 	{
+		LOG_DBG("append_vitals: exit rc=-ENOSPC (snprintf)");
 		return -ENOSPC;
 	}
 
 	LOG_INF("JXV[%u] motion=%u batt=%d.%02dV temp=%d", unix_time, motion, volts,
 			centivolts, temp_c);
-	return append_row(ctx, JUXTA_LOG_JXV, row);
+	rc = append_row(ctx, JUXTA_LOG_JXV, row);
+	LOG_DBG("append_vitals: exit rc=%d", rc);
+	return rc;
 }
 
 int juxta_log_append_ble_observation(struct juxta_log_context *ctx, uint32_t unix_time,
@@ -902,15 +950,19 @@ int juxta_log_append_ble_observation(struct juxta_log_context *ctx, uint32_t uni
 		return -EINVAL;
 	}
 
+	LOG_DBG("append_ble: enter t=%u peer=%s", unix_time, peer_id);
+
 	int rc = touch_all_for_calendar_day(ctx, juxta_settings_get(), unix_time);
 	if (rc != 0)
 	{
+		LOG_DBG("append_ble: exit rc=%d (touch_all)", rc);
 		return rc;
 	}
 
 	rc = ensure_file(ctx, JUXTA_LOG_JXB, juxta_settings_get(), unix_time);
 	if (rc != 0)
 	{
+		LOG_DBG("append_ble: exit rc=%d (ensure_file)", rc);
 		return rc;
 	}
 
@@ -918,11 +970,14 @@ int juxta_log_append_ble_observation(struct juxta_log_context *ctx, uint32_t uni
 					   rssi);
 	if (len < 0 || len >= (int)sizeof(row))
 	{
+		LOG_DBG("append_ble: exit rc=-ENOSPC (snprintf)");
 		return -ENOSPC;
 	}
 
 	LOG_INF("JXB[%u] %s rssi=%d", unix_time, peer_id, rssi);
-	return append_row(ctx, JUXTA_LOG_JXB, row);
+	rc = append_row(ctx, JUXTA_LOG_JXB, row);
+	LOG_DBG("append_ble: exit rc=%d", rc);
+	return rc;
 }
 
 /* Bytes streamed over BLE (after filename line; closed files omit trailing #EOF). */

@@ -157,10 +157,10 @@ stateDiagram-v2
     ConnectableAdv --> ConnectableAdv : Disconnect without timestamp\nResume slow blink
     ConnectableAdv --> ConnectedSync : iOS connects\nLED solid ON
 
-    ConnectedSync --> WaitDisconnect : timestamp received\nJXS time_set row appended
-    WaitDisconnect --> ProductionInit : Disconnected\n5x blink then LED off
+    ConnectedSync --> WaitDisconnect : timestamp received\nJXS rows: shelf_exit, user_connected, time_set
+    WaitDisconnect --> ProductionInit : Disconnected\nJXS user_disconnected; 5x blink then LED off
 
-    ProductionInit --> IDLE : LIS2DH12 init\nhardware_ready = true
+    ProductionInit --> IDLE : LIS2DH12 init\nhardware_ready = true\nJXS boot row appended
 
     IDLE --> SCANNING : scan interval elapsed
     IDLE --> ADVERTISING : adv interval elapsed
@@ -209,15 +209,15 @@ This is distinct from **slow blink** (datetime sync) and **fast blink** (DFU).
 
 | Gesture                                       | LED feedback                     | Effect                                                    |
 | --------------------------------------------- | -------------------------------- | --------------------------------------------------------- |
-| Apply at any time (device in shelf mode)      | LED ON immediately               | Wakes device from System OFF → cold boot                  |
-| Release < 7 s after cold boot                 | LED off → slow blink (50/450 ms) | Gateway advertising mode; waits for datetime sync         |
-| Hold ≥ 7 s after cold boot                    | 3× blink → fast blink (50/50 ms) | DFU mode; 5 s debounce then magnet swipe returns to shelf |
-| Any connect event                             | Solid ON                         | Active BLE connection                                     |
-| Disconnect after valid timestamp              | 5× blink → LED off               | Production init begins                                    |
-| Disconnect without timestamp                  | Slow blink resumes               | Restarts connectable advertising                          |
-| Magnet swipe during DFU fast-blink            | LED off                          | Returns device to shelf mode                              |
-| Magnet held during production (not connected) | 5× blink → LED off               | 5 s debounce then shelf mode                              |
-| NOR or accelerometer init failure             | Long blink (1 s / 1 s)           | Fault loop; no production operation                       |
+| Apply at any time (device in shelf mode)      | LED ON immediately               | Wakes device from System OFF → cold boot                                                                                       |
+| Release < 7 s after cold boot                 | LED off → slow blink (50/450 ms) | Gateway advertising mode; waits for datetime sync. JXS rows `shelf_exit`, `user_connected`, `time_set` deferred until sync     |
+| Hold ≥ 7 s after cold boot                    | 3× blink → fast blink (50/50 ms) | DFU mode; 5 s debounce then magnet swipe returns to shelf                                                                      |
+| Any connect event                             | Solid ON                         | Active BLE connection (`user_connected` in JXS once clock is valid)                                                            |
+| Disconnect after valid timestamp              | 5× blink → LED off               | Production init begins. JXS rows `user_disconnected` then `boot`                                                               |
+| Disconnect without timestamp                  | Slow blink resumes               | Restarts connectable advertising                                                                                               |
+| Magnet swipe during DFU fast-blink            | LED off                          | Returns device to shelf mode                                                                                                   |
+| Magnet held during production (not connected) | 5× blink → LED off               | 5 s debounce then shelf mode; appends `shelf_entry` to JXS                                                                     |
+| NOR or accelerometer init failure             | Long blink (1 s / 1 s)           | Fault loop; no production operation                                                                                            |
 
 ---
 
@@ -334,7 +334,7 @@ Each entry is `filename|size_in_bytes`. **Size** is the **CSV payload** byte cou
 
 ## NOR Flash Layout
 
-Logging schema **`jxta-nor-csv-v5`** ([`src/juxta_prod.h`](src/juxta_prod.h)). JXS event rows include **`adv_interval_s`** (after `scan_interval_s`). JXV vitals files carry a per-file NVS snapshot in two `#device_settings` comment lines immediately after the column header.
+Logging schema **`jxta-nor-csv-v5`** ([`src/juxta_prod.h`](src/juxta_prod.h)). JXS event rows include **`adv_interval_s`** (after `scan_interval_s`). Each new JXS pseudo-file leads with a `day_start` row that snapshots current NVS (subject, experiment, intervals) so the day is interpretable from JXS alone, without cross-referencing prior days. JXV and JXB stay strict CSV: a single column header followed by data rows only.
 
 | Region | Address               | Size  | Content               |
 | ------ | --------------------- | ----- | --------------------- |
@@ -348,19 +348,18 @@ All regions are append-only CSV. Each pseudo-file is physically stored as:
 ```
 JXSYYYYMMDD.csv
 unix,event,device_id,subject_id,experiment,fw_version,scan_interval_s,adv_interval_s,vitals_interval_s,ble_name
+1715200000,day_start,JX_9B10A1,JX_9B10A1,,5.8.0,30,5,60,JX_9B10A1
 1715200000,boot,JX_9B10A1,JX_9B10A1,,5.8.0,30,5,60,JX_9B10A1
 ```
 
 ```
 JXVYYYYMMDD.csv
 unix,motion,batt_v,temp_c
-#device_settings,subject_id,experiment,scan_interval_s,adv_interval_s,vitals_interval_s,inactivity_multiplier
-#device_settings,JX_9B10A1,,30,5,60,1
 1715200000,12,3.81,24
 #EOF
 ```
 
-Each new JXV file appends two **`#device_settings`** comment lines (current NVS when the file was opened) after the column header so vitals files stay interpretable without hunting older JXS for intervals or subject.
+Every new JXS pseudo-file (first boot of a region, calendar rollover, or after a `clearMemory` erase) opens with a `day_start` row carrying the NVS snapshot at file creation. JXV and JXB now contain only their column header and data rows — no `#`-prefixed comment lines — so any CSV parser that splits on commas works without special-casing.
 
 ```
 JXBYYYYMMDD.csv
@@ -377,15 +376,72 @@ Settings and the log-state cache live in nRF52840 internal flash (`storage_parti
 
 Hardware + iOS session (also summarized in the repo [`README.md`](../../README.md)):
 
-1. Flash `juxta5-8-prod` for `Juxta5-8_nRF52840`; RTT shows device ID, NVS load, NOR init, JXS `boot` row.
+1. Flash `juxta5-8-prod` for `Juxta5-8_nRF52840`; RTT shows device ID, NVS load, NOR init. On the sync-gate connection JXS records `shelf_exit`, then `user_connected`, then `time_set`; after the gateway disconnects, `user_disconnected`; after production init completes, `boot`.
 2. Connect (nRF Connect or iOS). Node READ returns camelCase JSON; `firmwareVersion` starts with `5.8`.
-3. Gateway `{"timestamp":…}` → `time_set` in JXS.
+3. Gateway `{"timestamp":…}` → `time_set` in JXS (preceded by the deferred `shelf_exit` and `user_connected` rows on the first sync of each boot).
 4. Gateway `{"sendFilenames":true}` → Filename indication lists `JXS|…;JXV|…;JXB|…`.
 5. Write a filename → File Transfer CSV stream (payload size matches listing) → final 3-byte `EOF` indication.
-6. Wait one vitals period → JXV grows; open a new day’s JXV (or after `clearMemory`) and confirm `#device_settings` lines after the header.
+6. Wait one vitals period → JXV grows. Open a new day's JXS (or after `clearMemory`) and confirm the file leads with a `day_start` row carrying the current NVS snapshot (subject, experiment, intervals). JXV/JXB carry only their column header and data rows (no `#device_settings` lines).
 7. Second `JX_XXXXXX` nearby during scan → JXB rows in RTT / NOR.
 8. Gateway `{"clearMemory":true}` → NOR erased, `memory_cleared` event; NVS settings unchanged on reconnect.
 9. Power cycle → NVS settings and log cache reconcile without full NOR rescan.
+
+---
+
+## Diagnostics
+
+The firmware emits a per-thread stack/CPU snapshot to RTT every vitals tick
+(default 60 s, NVS `vitals_interval_s`) via Zephyr's built-in thread analyzer
+([applications/juxta5-8-prod/prj.conf](prj.conf) `CONFIG_THREAD_ANALYZER=y`,
+`CONFIG_INIT_STACKS=y`, `CONFIG_THREAD_RUNTIME_STATS=y`). The snapshot is
+driven from `vitals_work_handler` in [`src/main.c`](src/main.c) so no extra
+thread is created.
+
+Example output (one block per 60 s):
+
+```
+<inf> juxta5_8_prod: vitals: thread_analyzer snapshot ↓
+<inf> thread_analyzer: sysworkq        : STACK: unused 4612 usage 3580 / 8192 (43 %); CPU: 12 %
+<inf> thread_analyzer: main            : STACK: unused 15104 usage 1280 / 16384 (7 %); CPU: <1 %
+<inf> thread_analyzer: BT RX WQ        : STACK: unused 1924 usage 2172 / 4096 (53 %); CPU: 3 %
+<inf> thread_analyzer: BT TX           : STACK: unused 1108 usage 428  / 1536 (27 %); CPU: 2 %
+<inf> thread_analyzer: idle            : STACK: unused 220  usage 100  / 320  (31 %); CPU: 80 %
+```
+
+### How to read it
+
+- `usage` is the **high-water mark** since boot — the deepest any call chain
+  has driven that thread's stack pointer. Pre-fill (0xAA) means the analyzer
+  can detect every byte that has ever been touched, not just current depth.
+- `CPU` is averaged since the last sample.
+
+### Thresholds
+
+| Condition                                       | Action                                                             |
+| ----------------------------------------------- | ------------------------------------------------------------------ |
+| Any thread `usage > 80 %`                       | Investigate — small headroom, single deep call chain may overrun   |
+| Any thread `usage > 95 %`                       | Imminent overrun; bump that thread's stack in `prj.conf` and reflash |
+| Monotonic growth across hours                   | Possible recursion or local buffers expanding — instrument that code path |
+| `idle` `CPU` collapses to 0 %                   | Some thread is busy-looping; check which one is climbing           |
+
+### Crash signature
+
+If RTT prints garbage with runs of `ª` (`0xAA`) followed by an MCUboot reboot,
+that is the Zephyr stack sentinel pattern leaking out of an overrun stack —
+the same byte that `CONFIG_INIT_STACKS=y` writes into the unused region. The
+**last `thread_analyzer:` block printed before the garbage names the thread
+that overran** and how close every other thread was. Capture full RTT to disk
+(J-Link RTT Viewer "Log to file" or `JLinkRTTLogger`) so the snapshot survives
+a multi-day soak.
+
+### What this does NOT capture
+
+- No persistent crash log on the device. A field unit that crashes still
+  reboots clean; the RTT log is the only record. To persist a `fault` row to
+  JXS across reboots, a fault handler + retained-RAM scheme would be needed
+  (separate work).
+- No effect on production: the analyzer is a read-only walk; no NOR writes,
+  no BLE radio interaction.
 
 ---
 
@@ -424,7 +480,7 @@ applications/juxta5-8-prod/
 | Watchdog                    | 30 s window, fed every 10 s, pauses on debug halt                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | NVS settings                | `subject_id`, `experiment`, `scan_interval_s`, `vitals_interval_s`, `adv_interval_s`, `inactivity_multiplier` **1–10** (plus `upload_path` slot always written as `**/**`; reserved bytes for legacy blob layout)                                                                                                                                                                                                                                                                                                                                    |
 | NOR CSV logging             | JXS events, JXV vitals, JXB BLE observations; append-only, `#EOF` on close                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| Daily file rotation         | `ensure_file()` in `[src/juxta_log.c](src/juxta_log.c)`: when the calendar date from `unix_time` no longer matches the active pseudo-file, the previous file is closed with `#EOF` and a new `*yyyymmdd.csv` is created. On each new **calendar day**, the first JXS/JXV/JXB append runs `touch_all_for_calendar_day()` so **all three** types get a dated file for that day (header + schema row only if there are no data rows yet; **JXV** also writes two `#device_settings` NVS snapshot lines after the schema), giving the gateway a consistent triple per day. Requires a valid clock; old files remain until Gateway `clearMemory` |
+| Daily file rotation         | `ensure_file()` in `[src/juxta_log.c](src/juxta_log.c)`: when the calendar date from `unix_time` no longer matches the active pseudo-file, the previous file is closed with `#EOF` and a new `*yyyymmdd.csv` is created. On each new **calendar day**, the first JXS/JXV/JXB append runs `touch_all_for_calendar_day()` so **all three** types get a dated file for that day. **JXS** new-file creation auto-emits a `day_start` row (NVS snapshot via the existing JXS columns) so the day is self-describing; **JXV/JXB** stay strict CSV (header + data rows only). Requires a valid clock; old files remain until Gateway `clearMemory`. **File-creation guarantee**: any JXS event with a valid clock (the first row written after a sync-gate is the auto-emitted `day_start`, immediately followed by `shelf_exit`) calls `touch_all_for_calendar_day` and creates JXS/JXV/JXB for today; rows logged with `unix_time == 0` are silently dropped. The `boot` row therefore always lands in an existing JXS file |
 | Log-state cache             | MCU NVS caches file offsets; scans NOR on cache miss                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | BLE state machine           | Non-connectable advertising when `adv_interval_s` is **1–120** s, any integer (**0** = off); passive scan bursts when `scan_interval_s` is **1–120** s, any integer (**0** = off; effective scan interval `**scan_interval_s` × `inactivity_multiplier**` when multiplier **> 1** and last vitals window had no motion, capped at **120** s); JXGA_ opportunistic connectable adv **disabled** in source (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV`)                                                                                                      |
 | Battery level in Node JSON  | SAADC mV sampled on connect and each vitals tick; calibrated factor 7.96×; linear 3.0–4.2 V → 0–100 %                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -434,13 +490,13 @@ applications/juxta5-8-prod/
 | Node JSON                   | Spec keys: `firmwareVersion`, `batteryLevel`, `memoryLevel`, `deviceId`, `subjectId`, `experiment`, `advInterval`, `scanInterval`, `inactivityMultiplier`                                                                                                                                                                                                                                                                                                                                                                                    |
 | Gateway commands            | `timestamp`, `sendFilenames`, `clearMemory`, `reset`, `scanInterval`, `advInterval`, `vitalsInterval`, `subjectId`, `experiment`, `inactivityMultiplier`                                                                                                                                                                                                                                                                                                                                                    |
 | BLE connection optimisation | MTU exchange initiated on connect; supervision timeout 4 s; preferred interval 30–50 ms via `bt_conn_le_param_update`                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| Production magnet-to-shelf  | Magnet held in production (not connected) → 5× blink → 5 s debounce → shelf mode                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Production magnet-to-shelf  | Magnet held in production (not connected) → 5× blink → JXS `shelf_entry` row → 5 s debounce → shelf mode                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | Debugger simulation loop    | `CoreDebug->DHCSR` detects J-Link; simulates shelf/wake/DFU cycle in-band; `sys_reboot()` restarts loop                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | Vitals logging              | LIS2DH12 temperature, SAADC battery voltage, motion count → JXV; motion snapshot also drives inactivity **scan** interval multiplier                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | BLE observation logging     | `JX_XXXXXX` peer detection → JXB rows with observer/peer/rssi                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| JXS provenance rows         | `boot`, `time_set`, `settings_changed`, `user_connected`, `user_disconnected`, `memory_cleared`, `low_battery`                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| JXS provenance rows         | `day_start`, `shelf_exit`, `user_connected`, `time_set`, `user_disconnected`, `boot`, `shelf_entry`, `settings_changed`, `memory_cleared`, `low_battery` — together these read as a chronological device lifecycle: every new JXS pseudo-file opens with a `day_start` row (current NVS snapshot); each magnet wake produces a `shelf_exit`; each real BLE session is bracketed by `user_connected` / `user_disconnected`; each operator-initiated shelf return writes `shelf_entry` before power-off. `time_set` is written every time the gateway supplies a clock value (e.g. once per sync-gate session) |
 | File listing wire format    | `name\|size;name\|size;…` indication; listing **size** is CSV payload only (no filename line, no `#EOF`); transfer ends with 3-byte `EOF` indication on File Transfer                                                                                                                                                                                                                                                                                                                                                                                |
-| JXV settings snapshot       | On each new JXV pseudo-file: two `#device_settings` CSV comment lines (subject, experiment, scan/adv/vitals intervals, inactivity multiplier) after schema row                                                                                                                                                                                                                                                                                                                                                                                       |
+| Day-start provenance        | Every new JXS pseudo-file leads with a `day_start` row (current NVS settings via the standard JXS columns: subject, experiment, intervals, ble_name). JXV/JXB stay strict CSV (header + data rows). Replaces the previous `#device_settings` JXV comment lines that broke single-header CSV parsing                                                                                                                                                                                                                                                       |
 | FUEL pin correction         | FUEL on P0.30/AIN6 (was incorrectly mapped to P0.28/AIN4 = AXY_INT2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 

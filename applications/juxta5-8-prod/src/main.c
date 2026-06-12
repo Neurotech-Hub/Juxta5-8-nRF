@@ -27,12 +27,14 @@
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gap.h>
 #include <zephyr/bluetooth/hci.h>
+#include <zephyr/debug/thread_analyzer.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/irq.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/logging/log_ctrl.h>
 #include <zephyr/mgmt/mcumgr/transport/smp_bt.h>
 #include <zephyr/net_buf.h>
 #include <zephyr/random/random.h>
@@ -203,10 +205,47 @@ static void led_blink(uint8_t count, uint32_t on_ms, uint32_t off_ms)
 
 /* ---------------------------------------------------------------------------
  * Watchdog
+ *
+ * DIAGNOSTIC BUILD: 5 s window (was 30 s) so a hang is caught quickly during
+ * the current bug hunt.  Combined with the 2 s periodic feed timer that
+ * still leaves 3 s of safety margin against transient workqueue stalls.
+ *
+ * Pre-warn callback: nRF52 hardware fires a TIMEOUT IRQ ~2 LFCLK cycles
+ * (~61 µs) before the SoC reset.  That is barely enough RTT bandwidth to
+ * emit one or two log lines, but the *first* line — the name of the thread
+ * that was running when the WDT finally tripped — is the single most
+ * valuable datum we can capture about a silent hang.  thread_analyzer_print
+ * is invoked after that in case enough headroom remains for the per-thread
+ * stack snapshot to land.
  * -------------------------------------------------------------------------*/
 static const struct device *wdt;
 static int wdt_channel_id = -1;
 static struct k_timer wdt_feed_timer;
+
+#define WDT_WINDOW_MS 5000U
+#define WDT_FEED_PERIOD_MS 2000U
+
+static void wdt_warn_cb(const struct device *dev, int channel)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(channel);
+
+	/* Force the logging subsystem into synchronous mode so any pending
+	 * lines (and the ones we are about to emit) actually reach RTT before
+	 * the hardware reset trips.  Without this, deferred log entries sit in
+	 * a ring buffer that the reset wipes before the logging thread can
+	 * drain them. */
+	LOG_PANIC();
+
+	struct k_thread *cur = k_current_get();
+	const char *name = (cur != NULL && cur->name[0] != '\0') ? cur->name : "?";
+
+	LOG_ERR("WDT: imminent reset — last running thread: %s", name);
+	/* Best-effort: the IRQ-to-reset window is ~60 µs on nRF52, so we may
+	 * only emit a fraction of these lines before the SoC resets.  Anything
+	 * we catch is upside; the LOG_ERR above is the must-have. */
+	thread_analyzer_print(0);
+}
 
 static void wdt_feed_timer_cb(struct k_timer *timer)
 {
@@ -230,8 +269,8 @@ static void prod_wdt_feed(void)
 static int init_watchdog(void)
 {
 	const struct wdt_timeout_cfg cfg = {
-		.window = {.min = 0U, .max = 30000U},
-		.callback = NULL,
+		.window = {.min = 0U, .max = WDT_WINDOW_MS},
+		.callback = wdt_warn_cb,
 		.flags = WDT_FLAG_RESET_SOC,
 	};
 
@@ -255,8 +294,9 @@ static int init_watchdog(void)
 	}
 
 	k_timer_init(&wdt_feed_timer, wdt_feed_timer_cb, NULL);
-	k_timer_start(&wdt_feed_timer, K_MSEC(10000), K_MSEC(10000));
-	LOG_INF("Watchdog: 30 s window");
+	k_timer_start(&wdt_feed_timer, K_MSEC(WDT_FEED_PERIOD_MS), K_MSEC(WDT_FEED_PERIOD_MS));
+	LOG_INF("Watchdog: %u ms window, %u ms feed (DIAGNOSTIC BUILD)",
+			WDT_WINDOW_MS, WDT_FEED_PERIOD_MS);
 	return 0;
 }
 
@@ -509,6 +549,12 @@ static struct juxta_log_context log_ctx;
 static volatile bool datetime_synchronized;
 static volatile bool ble_connected;
 static bool hardware_ready;
+/* Deferred lifecycle logging: a sync-gate connection arrives before any
+ * timestamp has been set, so we cannot write a useful JXS row from
+ * on_connected.  Flag here, then flush from juxta_ble_datetime_synchronized
+ * once the gateway has supplied a valid time. */
+static volatile bool pending_user_connected_log;
+static bool shelf_exit_logged_this_boot;
 
 /* Forward declarations for BLE state — defined in the operational state machine
  * section below, but referenced earlier by vitals_work_handler. */
@@ -594,6 +640,14 @@ static void vitals_work_handler(struct k_work *work)
 		k_sleep(K_MSEC(50)); /* allow NOR write to complete */
 		enter_shelf_mode();
 	}
+
+	/* Diagnostic: dump per-thread stack high-water marks + CPU stats to RTT.
+	 * Read-only walk over kernel structures, safe from any context.  Pre-fill
+	 * is CONFIG_INIT_STACKS=y so the "usage" numbers reflect the maximum
+	 * stack depth a thread has ever touched, not just current depth.  Look
+	 * for monotonic growth across ticks or any thread above 80 % usage. */
+	LOG_INF("vitals: thread_analyzer snapshot ↓");
+	thread_analyzer_print(0);
 }
 
 static void vitals_timer_cb(struct k_timer *timer)
@@ -711,10 +765,19 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 	set_led_mode(LED_MODE_ON); /* solid LED while connected */
 	juxta_ble_connection_established(conn);
 
-	if (hardware_ready)
+	/* Log immediately if the clock is valid (in-production session).
+	 * During the sync gate the gateway connects before sending the
+	 * timestamp, so defer the row until juxta_ble_datetime_synchronized
+	 * fires with a valid time. */
+	uint32_t now = juxta_time_now();
+	if (now != 0U)
 	{
 		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
-									 "user_connected", juxta_time_now());
+									 "user_connected", now);
+	}
+	else
+	{
+		pending_user_connected_log = true;
 	}
 }
 
@@ -729,12 +792,20 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 
 	if (hardware_ready)
 	{
-		/* Production: LED off, log event, resume state machine */
+		/* Production: LED off, resume state machine */
 		set_led_mode(LED_MODE_OFF);
-		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
-									 "user_disconnected", juxta_time_now());
 	}
 	/* During sync phase: LED transitions are handled by wait_for_datetime_sync() */
+
+	/* Always attempt the disconnect row.  juxta_log_append_event silently
+	 * no-ops when the clock is unset, so a sync-gate disconnect before any
+	 * timestamp arrived is harmless.  A connect without a matching disconnect
+	 * pairs only with shelf_entry / shelf_exit. */
+	(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
+								 "user_disconnected", juxta_time_now());
+
+	/* No point flushing a deferred connect after the connection has ended. */
+	pending_user_connected_log = false;
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -1258,6 +1329,26 @@ void juxta_ble_datetime_synchronized(void)
 {
 	datetime_synchronized = true;
 	LOG_INF("Datetime synchronized");
+
+	/* The gateway has supplied a valid clock.  Flush any lifecycle rows
+	 * that were waiting for a usable timestamp.  Order matters so the
+	 * resulting JXS reads chronologically as: shelf_exit, user_connected,
+	 * time_set (written by the caller in ble_service.c). */
+	uint32_t now = juxta_time_now();
+
+	if (!shelf_exit_logged_this_boot)
+	{
+		shelf_exit_logged_this_boot = true;
+		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
+									 "shelf_exit", now);
+	}
+
+	if (pending_user_connected_log)
+	{
+		pending_user_connected_log = false;
+		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
+									 "user_connected", now);
+	}
 }
 
 void juxta_ble_reset_requested(void)
@@ -1551,7 +1642,7 @@ int main(void)
 
 			LOG_INF("Remove magnet — entering shelf mode");
 			(void)juxta_log_append_event(&log_ctx, juxta_settings_get(),
-										 device_id, "user_disconnected",
+										 device_id, "shelf_entry",
 										 juxta_time_now());
 			k_sleep(K_SECONDS(5));
 			enter_shelf_mode(); /* does not return */

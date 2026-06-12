@@ -393,12 +393,11 @@ static int apply_gateway_command(const char *json)
 		/* Always set the clock — needed for file naming and row timestamps. */
 		juxta_time_set(value);
 		LOG_INF("gateway timestamp=%u", value);
-		/* Log only in production; during the sync phase no files exist yet. */
-		if (production_ready)
-		{
-			(void)juxta_log_append_event(log_ctx, &next, device_id, "time_set", value);
-		}
+		/* Notify main.c first so it can flush any deferred lifecycle rows
+		 * (shelf_exit, user_connected) that arrived before the clock was set.
+		 * Then append the time_set row so the JXS reads chronologically. */
 		juxta_ble_datetime_synchronized();
+		(void)juxta_log_append_event(log_ctx, &next, device_id, "time_set", value);
 	}
 
 	if (extract_bool_true(json, "sendFilenames"))

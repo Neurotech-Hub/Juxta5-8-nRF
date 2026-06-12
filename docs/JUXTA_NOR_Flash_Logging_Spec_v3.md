@@ -76,14 +76,12 @@ Example physical flash contents:
 ```text
 JXV20260507.csv
 unix,motion,batt_v,temp_c
-#device_settings,subject_id,experiment,scan_interval_s,adv_interval_s,vitals_interval_s,inactivity_multiplier
-#device_settings,JX_9B10A1,,30,5,60,1
 1715200000,12,3.81,24
 1715200060,14,3.80,24
 #EOF
 ```
 
-**Juxta5-8 production** opens each new JXV with the same two `#device_settings` lines (NVS snapshot at file creation) after the schema row so downstream tools do not need older JXS files for subject and interval context.
+**Juxta5-8 production** keeps JXV (and JXB) as strict CSV — a single column header followed by data rows only. The NVS snapshot lives in the JXS `day_start` row at the head of each day's JXS file (see the JXS section below), so every day is interpretable from JXS alone without hunting historical files.
 
 ---
 
@@ -107,7 +105,7 @@ JXV20260507.csv
 unix,motion,batt_v,temp_c
 ```
 
-Optional **leading metadata** (same production behaviour as in the physical layout example above): two lines beginning with `#device_settings` repeat the column names then the current NVS values (`subject_id`, `experiment`, `scan_interval_s`, `adv_interval_s`, `vitals_interval_s`, `inactivity_multiplier`) when the vitals file was created.
+JXV holds **only** the column header and data rows — no comment lines, no metadata. NVS provenance is recorded in the JXS `day_start` row at the head of each day's JXS file (see the JXS section below). Vitals timestamps share a calendar day with their day's JXS, so cross-referencing the two requires only matching by date.
 
 ## Example Rows
 
@@ -278,9 +276,19 @@ The **`mode`** column name is retained for schema compatibility. **Juxta5-8** fi
 **Juxta5-8 production firmware** (`applications/juxta5-8-prod`, `JUXTA_LOG_SCHEMA` `jxta-nor-csv-v5`): JXS rows omit `mode` and include **`adv_interval_s`** after **`scan_interval_s`**:  
 `unix,event,device_id,subject_id,experiment,fw_version,scan_interval_s,adv_interval_s,vitals_interval_s,ble_name`.
 
+**Day-start row**: each time `juxta5-8-prod` creates a new JXS pseudo-file (first
+boot of a region, calendar rollover, or after a `clearMemory` erase), it
+auto-emits a single `day_start` row that snapshots current NVS via the JXS
+columns (`subject_id`, `experiment`, intervals, `ble_name`). This makes each
+day's data interpretable from JXS alone — downstream tools never need to chase
+prior days for subject or interval context. It also restores the strict
+single-header CSV contract that the legacy JXV `#device_settings` comment
+lines broke.
+
 ## Example Rows
 
 ```csv
+1715200000,day_start,JX_9B10A1,mouse_07,social_v1,1.2.3,normal,30,60,JX_9B10A1
 1715200000,boot,JX_9B10A1,mouse_07,social_v1,1.2.3,normal,30,60,JX_9B10A1
 1715220000,settings_changed,JX_9B10A1,mouse_07,social_v1,1.2.3,normal,10,60,JX_9B10A1
 1715260000,subject_changed,JX_9B10A1,mouse_08,social_v1,1.2.3,normal,30,60,JX_9B10A1
@@ -288,20 +296,48 @@ The **`mode`** column name is retained for schema compatibility. **Juxta5-8** fi
 
 ## Logged Events
 
-Recommended events:
+Recommended events (the `juxta5-8-prod` implementation uses the lifecycle vocabulary
+described below; other firmwares may use a subset or extend it):
 
 ```text
+day_start
+shelf_exit
+user_connected
+time_set
+user_disconnected
 boot
-reset
+shelf_entry
 settings_changed
+memory_cleared
+low_battery
+reset
 mode_changed
 subject_changed
 firmware_updated
-user_connected
-user_disconnected
-time_set
-low_battery
 ```
+
+Lifecycle events (`juxta5-8-prod`) read in chronological order across a
+shelf-wake → retrieve → production → magnet-shelf cycle:
+
+- `day_start` — auto-emitted at the head of every new JXS pseudo-file
+  (first creation, calendar rollover, post-`clearMemory`). Carries the
+  current NVS snapshot via the standard JXS columns, so each day's data
+  needs no cross-day lookup to interpret.
+- `shelf_exit` — first row written after a magnet wake; emitted by
+  `juxta_ble_datetime_synchronized()` once the gateway has supplied a valid
+  clock (one-shot per boot).
+- `user_connected` — every real BLE link-layer connection; deferred to the
+  time-set moment when it arrives during the sync gate (before the clock is
+  valid).
+- `time_set` — every gateway-supplied timestamp write.
+- `user_disconnected` — every real BLE link-layer disconnect.
+- `boot` — production init complete (timers and BLE state machine starting).
+- `shelf_entry` — operator held the magnet during production to enter shelf
+  mode; written immediately before `enter_shelf_mode()`.
+
+This separates the two distinct "device left the radio" reasons that previously
+both wrote `user_disconnected`: a real BLE disconnect (`user_disconnected`)
+vs. an operator-initiated magnet shelf (`shelf_entry`).
 
 ## Subject ID Rules
 
