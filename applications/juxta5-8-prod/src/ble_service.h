@@ -45,5 +45,11 @@ void juxta_ble_set_production_ready(void);
 void juxta_ble_timing_update_trigger(void);
 void juxta_ble_datetime_synchronized(void);
 void juxta_ble_reset_requested(void);
+/* Called from the BT RX thread when a gateway `clearMemory` command arrives.
+ * The implementation must defer the actual NOR erase off the BT RX thread so
+ * the GATT write callback returns promptly (the erase is many seconds long;
+ * doing it inline blows past the BLE supervision timeout and stalls every
+ * other consumer of the BT RX queue). */
+void juxta_ble_clear_memory_requested(void);
 
 #endif /* JUXTA_BLE_SERVICE_H_ */

@@ -37,8 +37,11 @@
 /* NVS-backed cache uses a tighter name field to keep the struct small.
  * Filenames are at most "JXS20260507.csv" = 15 chars + null. */
 #define JUXTA_CACHE_NAME_LEN 20
-/* 3 log types × up to 5 days before clearMemory = 15; keep at 16 for headroom. */
-#define JUXTA_MAX_FILES 16
+/* 3 log types × up to 16 days = 48; sized for 7–12 day deployments with
+ * margin.  The NVS-backed juxta_log_cache (8 B header + 32 B per file) is
+ * ~1.5 KB at 48 entries — well under a 4 KB internal-flash sector and well
+ * under the per-entry write limit of the SETTINGS_NVS backend. */
+#define JUXTA_MAX_FILES 48
 #define JUXTA_TRANSFER_CHUNK_SIZE 512
 
 /* Persisted operating mode (NVS-backed; see juxta_settings_get_op_mode /

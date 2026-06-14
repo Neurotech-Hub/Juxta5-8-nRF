@@ -41,6 +41,7 @@
 #include <zephyr/mgmt/mcumgr/transport/smp_bt.h>
 #include <zephyr/net_buf.h>
 #include <zephyr/random/random.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/poweroff.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/sys/util.h>
@@ -210,8 +211,17 @@ static void led_blink(uint8_t count, uint32_t on_ms, uint32_t off_ms)
  * Watchdog
  *
  * DIAGNOSTIC BUILD: 5 s window (was 30 s) so a hang is caught quickly during
- * the current bug hunt.  Combined with the 2 s periodic feed timer that
- * still leaves 3 s of safety margin against transient workqueue stalls.
+ * the current bug hunt.  Combined with the 2 s periodic feed (delayable work
+ * on the system workqueue) that still leaves 3 s of safety margin against
+ * transient stalls.
+ *
+ * IMPORTANT: the feed runs on the system workqueue (NOT a k_timer ISR
+ * callback).  This means a wedged system workqueue — the most likely silent-
+ * hang signature in this firmware — stops feeding the dog and the SoC resets
+ * within the 5 s window, producing a wdt_recovery_dog row instead of going
+ * silent forever.  Long legit work paths (NOR append burst, scan flush,
+ * erase loop) still call prod_wdt_feed() inline to defend against the very
+ * rare case where one of them legitimately exceeds the 2 s feed cadence.
  *
  * Pre-warn callback: nRF52 hardware fires a TIMEOUT IRQ ~2 LFCLK cycles
  * (~61 µs) before the SoC reset.  That is barely enough RTT bandwidth to
@@ -223,7 +233,7 @@ static void led_blink(uint8_t count, uint32_t on_ms, uint32_t off_ms)
  * -------------------------------------------------------------------------*/
 static const struct device *wdt;
 static int wdt_channel_id = -1;
-static struct k_timer wdt_feed_timer;
+static struct k_work_delayable wdt_feed_work;
 
 /* RTC checkpoint timer — refreshes the retained-RAM snapshot once per second
  * so the production recovery boot branch can restore the clock to within
@@ -256,13 +266,18 @@ static void wdt_warn_cb(const struct device *dev, int channel)
 	thread_analyzer_print(0);
 }
 
-static void wdt_feed_timer_cb(struct k_timer *timer)
+static void wdt_feed_work_handler(struct k_work *work)
 {
-	ARG_UNUSED(timer);
+	ARG_UNUSED(work);
 	if (wdt && wdt_channel_id >= 0)
 	{
 		(void)wdt_feed(wdt, wdt_channel_id);
 	}
+	/* Self-resubmit on the system workqueue.  If the workqueue is wedged
+	 * (the most likely silent-hang signature here), the resubmission still
+	 * happens — but the *handler* never runs again, so no wdt_feed() call
+	 * follows and the SoC resets within WDT_WINDOW_MS. */
+	(void)k_work_reschedule(&wdt_feed_work, K_MSEC(WDT_FEED_PERIOD_MS));
 }
 
 static void rtc_checkpoint_cb(struct k_timer *timer)
@@ -311,9 +326,9 @@ static int init_watchdog(void)
 		return rc;
 	}
 
-	k_timer_init(&wdt_feed_timer, wdt_feed_timer_cb, NULL);
-	k_timer_start(&wdt_feed_timer, K_MSEC(WDT_FEED_PERIOD_MS), K_MSEC(WDT_FEED_PERIOD_MS));
-	LOG_INF("Watchdog: %u ms window, %u ms feed (DIAGNOSTIC BUILD)",
+	k_work_init_delayable(&wdt_feed_work, wdt_feed_work_handler);
+	(void)k_work_reschedule(&wdt_feed_work, K_MSEC(WDT_FEED_PERIOD_MS));
+	LOG_INF("Watchdog: %u ms window, %u ms feed via system workqueue (DIAGNOSTIC BUILD)",
 			WDT_WINDOW_MS, WDT_FEED_PERIOD_MS);
 	return 0;
 }
@@ -368,8 +383,26 @@ static int sample_battery_mv(void)
  * -------------------------------------------------------------------------*/
 static void prepare_for_shelf_mode(void);
 
+/* One-shot guard: enter_shelf_mode can be reached from the main thread
+ * (magnet hold, fresh boot, sub-debounce wake), the system workqueue
+ * (gateway "reset" via shelf_work_handler), and the vitals work handler
+ * (brownout).  Two concurrent entries would double-call bt_disable() /
+ * sys_poweroff() / sys_reboot() and race on the LED/GPIO teardown.  The
+ * losing caller drops into k_sleep(K_FOREVER) so it never returns from
+ * what is effectively a "no return" function. */
+static atomic_t shelf_entry_claimed;
+
 static void enter_shelf_mode(void)
 {
+	if (!atomic_cas(&shelf_entry_claimed, 0, 1))
+	{
+		LOG_WRN("enter_shelf_mode: re-entry — parking caller");
+		for (;;)
+		{
+			k_sleep(K_FOREVER);
+		}
+	}
+
 	bool debug = (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0U;
 
 	/* Persist op_mode := SHELF *before* the soft reboot / sys_poweroff() so a
@@ -1056,6 +1089,16 @@ static void wait_for_datetime_sync(void)
 	LOG_INF("Datetime sync: success — 5 blinks then production init");
 	led_blink(5U, 50U, 100U);
 	set_led_mode(LED_MODE_OFF);
+
+	/* Sync-gate stack snapshot.  This is the heaviest BT RX usage path in
+	 * the firmware (file listing, file transfer, optional clearMemory, all
+	 * with newlib float snprintf/sscanf), and the only window where the
+	 * radio is connectable.  Sampling here captures the high-water mark
+	 * for the BT RX, system workqueue, and main stacks before production
+	 * starts — i.e., before the periodic vitals tick begins to overwrite
+	 * the analyzer's view.  Pure diagnostics: no behaviour change. */
+	LOG_INF("sync_gate: thread_analyzer snapshot ↓");
+	thread_analyzer_print(0);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1442,6 +1485,38 @@ void juxta_ble_reset_requested(void)
 	(void)k_work_reschedule(&shelf_work, K_MSEC(10));
 }
 
+static struct k_work clear_memory_work;
+
+static void clear_memory_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	/* Runs on the system workqueue, off the BT RX thread.  juxta_log_format
+	 * itself walks every sector in JXS/JXV/JXB (~4 MB total) and now feeds
+	 * the watchdog per sector via prod_wdt_feed(), so this can sit on the
+	 * workqueue for many seconds without tripping the WDT or starving
+	 * other queue items above the 2 s feed cadence. */
+	LOG_INF("clearMemory: erasing all NOR CSV regions");
+	int rc = juxta_log_format(&log_ctx);
+
+	if (rc != 0)
+	{
+		LOG_ERR("clearMemory: erase failed: %d", rc);
+	}
+	else
+	{
+		LOG_INF("clearMemory: erase complete");
+	}
+}
+
+void juxta_ble_clear_memory_requested(void)
+{
+	/* Called from the BT RX thread via the gateway "clearMemory" command.
+	 * Submit onto the system workqueue so the multi-second erase does not
+	 * run inside the GATT write callback (which would stall the BT RX
+	 * thread far beyond the BLE supervision timeout). */
+	(void)k_work_submit(&clear_memory_work);
+}
+
 /* ---------------------------------------------------------------------------
  * main
  * -------------------------------------------------------------------------*/
@@ -1478,6 +1553,7 @@ int main(void)
 	 * -------------------------------------------------------------- */
 	k_work_init(&led_work, led_work_handler);
 	k_work_init_delayable(&shelf_work, shelf_work_handler);
+	k_work_init(&clear_memory_work, clear_memory_work_handler);
 	k_timer_init(&led_timer, led_timer_cb, NULL);
 
 	/* ----------------------------------------------------------------
@@ -1737,6 +1813,11 @@ int main(void)
 				(unsigned)saved_mode, (int)is_silent_reset,
 				(int)recovery_attempted, (int)recovery_full);
 	}
+
+	/* Register the long-op tick before juxta_log_init so any erase the
+	 * init/recovery path triggers (need_format branch) is also covered.
+	 * The hook itself just feeds the watchdog; see juxta_log.h for why. */
+	juxta_log_set_long_op_tick(prod_wdt_feed);
 
 	rc = juxta_log_init(&log_ctx, juxta_settings_get(), device_id);
 	if (rc != 0)

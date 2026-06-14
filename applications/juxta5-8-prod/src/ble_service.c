@@ -24,9 +24,13 @@ LOG_MODULE_REGISTER(juxta_ble_service, LOG_LEVEL_INF);
 /* Incoming write: just a filename ("JXS20260508.csv" = 15 chars + null). */
 #define FILENAME_WRITE_MAX_SIZE JUXTA_FILE_NAME_LEN
 
-/* Outgoing listing: JUXTA_MAX_FILES entries, each up to ~24 chars ("name|size;").
- * 16 files × 24 chars = 384 chars; 512 gives comfortable headroom. */
-#define FILENAME_LISTING_MAX_SIZE 512
+/* Outgoing listing: JUXTA_MAX_FILES entries, each up to ~24 chars ("name|size;")
+ * plus the terminal "EOF" token.  At JUXTA_MAX_FILES=48 that is ~1155 chars;
+ * 1536 gives comfortable headroom for a 12-day deployment + EOF + null.
+ * The buffer is sent in MTU-sized slices over the filename characteristic
+ * (see send_file_listing / send_next_listing_chunk); the iOS client buffers
+ * chunks until it sees the trailing "...;EOF" or a standalone "EOF" frame. */
+#define FILENAME_LISTING_MAX_SIZE 1536
 
 static struct juxta_log_context *log_ctx;
 static struct bt_conn *current_conn;
@@ -44,6 +48,17 @@ static char filename_listing[FILENAME_LISTING_MAX_SIZE]; /* sent to iOS */
 static uint8_t transfer_chunk[JUXTA_TRANSFER_CHUNK_SIZE];
 static struct juxta_file_entry transfer_entry;
 static uint32_t transfer_offset;
+
+/* Chunked filename-listing transmit state.  juxta_log_list_files() builds
+ * the full "name|size;name|size;...EOF" payload into `filename_listing`,
+ * then send_file_listing() streams it out in MTU-sized slices over the
+ * existing indication path.  The iOS client buffers indications until it
+ * sees the trailing "...;EOF" (handled in ContentView.handleFilenameCharacteristicUTF8),
+ * so no extra framing is required — `juxta_log_list_files` already terminates
+ * with "EOF" and that lands at the end of the last slice. */
+static size_t listing_tx_len;
+static size_t listing_tx_offset;
+static bool listing_tx_active;
 
 static const struct bt_gatt_attr *filename_char_attr;
 static const struct bt_gatt_attr *file_transfer_char_attr;
@@ -244,6 +259,8 @@ static int send_indication(struct bt_conn *conn, const struct bt_gatt_attr *attr
 	return rc;
 }
 
+static int send_next_listing_chunk(void);
+
 static void filename_indication_confirmed(struct bt_conn *conn,
 										  struct bt_gatt_indicate_params *params, uint8_t err)
 {
@@ -254,6 +271,17 @@ static void filename_indication_confirmed(struct bt_conn *conn,
 	if (err != 0U)
 	{
 		LOG_WRN("filename indication failed: 0x%02x", err);
+		listing_tx_active = false;
+		listing_tx_len = 0;
+		listing_tx_offset = 0;
+		return;
+	}
+
+	if (listing_tx_active)
+	{
+		/* Drive the next slice; on completion this short-circuits and
+		 * clears listing_tx_active itself. */
+		(void)send_next_listing_chunk();
 	}
 }
 
@@ -283,6 +311,47 @@ static void file_transfer_indication_confirmed(struct bt_conn *conn,
 	continue_file_transfer();
 }
 
+/* Push the next slice of `filename_listing` over the filename characteristic.
+ * Slice size is current_mtu - 3 (ATT opcode + handle), matching the file-
+ * transfer chunk sizing.  Returns 0 when the entire listing has been
+ * dispatched and listing_tx_active has been cleared, or the error from the
+ * underlying bt_gatt_indicate() call. */
+static int send_next_listing_chunk(void)
+{
+	if (!listing_tx_active)
+	{
+		return 0;
+	}
+	if (!current_conn || !filename_char_attr)
+	{
+		listing_tx_active = false;
+		return -ENOTCONN;
+	}
+	if (listing_tx_offset >= listing_tx_len)
+	{
+		listing_tx_active = false;
+		LOG_INF("file listing transfer complete (%zu bytes)", listing_tx_len);
+		return 0;
+	}
+
+	size_t max_chunk = (current_mtu > 3U) ? (size_t)(current_mtu - 3U) : 20U;
+	size_t remaining = listing_tx_len - listing_tx_offset;
+	size_t chunk_len = MIN(max_chunk, remaining);
+
+	int rc = send_indication(current_conn, filename_char_attr,
+				 filename_listing + listing_tx_offset,
+				 (uint16_t)chunk_len, filename_indication_confirmed);
+	if (rc != 0)
+	{
+		LOG_WRN("file listing chunk indication busy/failed: %d", rc);
+		listing_tx_active = false;
+		return rc;
+	}
+
+	listing_tx_offset += chunk_len;
+	return 0;
+}
+
 static int send_file_listing(struct bt_conn *conn)
 {
 	int len = juxta_log_list_files(log_ctx, filename_listing, sizeof(filename_listing));
@@ -295,13 +364,20 @@ static int send_file_listing(struct bt_conn *conn)
 
 	LOG_INF("file listing (%d bytes): %s", len, filename_listing);
 
-	if (conn && filename_char_attr)
+	if (!conn || !filename_char_attr)
 	{
-		return send_indication(conn, filename_char_attr, filename_listing, (uint16_t)len,
-							   filename_indication_confirmed);
+		return 0;
 	}
 
-	return 0;
+	/* Initialise the chunked transmit; send_next_listing_chunk() dispatches
+	 * the first slice synchronously, and filename_indication_confirmed
+	 * drives every slice thereafter.  The trailing "EOF" produced by
+	 * juxta_log_list_files() lands in the final slice, which is what the
+	 * iOS client's "buffer contains '|' and 'EOF'" check keys on. */
+	listing_tx_len = (size_t)len;
+	listing_tx_offset = 0;
+	listing_tx_active = true;
+	return send_next_listing_chunk();
 }
 
 static int start_transfer(const char *name)
@@ -407,11 +483,17 @@ static int apply_gateway_command(const char *json)
 
 	if (extract_bool_true(json, "clearMemory"))
 	{
-		/* Always honored — explicit destructive action, not gated by production_ready.
-		 * Erase only; file creation is deferred to the next data write (ProductionInit
-		 * "boot" event or first vitals/scan row), consistent with the init path. */
-		LOG_INF("clearMemory: erasing all NOR CSV regions");
-		(void)juxta_log_format(log_ctx);
+		/* Always honored — explicit destructive action, not gated by
+		 * production_ready.  Deferred onto the system workqueue (see
+		 * juxta_ble_clear_memory_requested in main.c): the erase walks
+		 * every NOR sector and takes many seconds, far past the BLE
+		 * supervision timeout, so running it inline on the BT RX thread
+		 * would disconnect the gateway and block every other GATT
+		 * write/indication for the duration.  File creation is deferred
+		 * to the next data write (ProductionInit "boot" event or first
+		 * vitals/scan row), consistent with the init path. */
+		LOG_INF("clearMemory: deferring NOR erase to system workqueue");
+		juxta_ble_clear_memory_requested();
 	}
 
 	if (extract_bool_true(json, "reset"))
@@ -708,6 +790,12 @@ void juxta_ble_connection_terminated(void)
 	transfer_eof_pending = false;
 	transfer_active = false;
 	indication_pending = false;
+	/* Drop any half-streamed listing; the iOS client also resets its
+	 * accumulation buffer on disconnect, so a fresh session always starts
+	 * from an empty state on both sides. */
+	listing_tx_active = false;
+	listing_tx_len = 0;
+	listing_tx_offset = 0;
 }
 
 int juxta_ble_get_status(uint16_t *mtu, bool *is_connected, bool *is_transfer_active)

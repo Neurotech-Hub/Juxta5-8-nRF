@@ -1,10 +1,16 @@
-# Keep legacy materials as read-only reference.
-Reference/
-
 # --- Zephyr / nRF Connect SDK -------------------------------------------------
 # Standard `build/` plus common multi-configuration names (e.g. build-adv, build-scan).
 applications/**/build/
 applications/**/build-*/
+
+# Exception: keep the signed DFU package for juxta5-8-prod in the repo so the
+# latest MCUboot SMP BLE image is always available alongside the source (no
+# rebuild required to flash via nRF Device Manager).  Git cannot re-include a
+# file inside an excluded directory, so we (1) un-ignore the build dir, (2)
+# re-ignore everything in it, then (3) un-ignore the one file we want.
+!applications/juxta5-8-prod/build/
+applications/juxta5-8-prod/build/*
+!applications/juxta5-8-prod/build/dfu_application.zip
 
 # Top-level west/sysbuild output if you build from the repo root.
 /build/

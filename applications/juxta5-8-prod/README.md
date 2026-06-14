@@ -4,6 +4,18 @@ Production Hublink firmware for Juxta5-8 (nRF52840). Combines Hublink GATT BLE, 
 
 Repository overview and bring-up apps: [`README.md`](../../README.md). NOR CSV field definitions: [`docs/JUXTA_NOR_Flash_Logging_Spec_v3.md`](../../docs/JUXTA_NOR_Flash_Logging_Spec_v3.md).
 
+## Quick Start
+
+End-to-end user flow as orchestrated by the **Voleo iOS app**. Magnet timing is enforced by firmware (`MAGNET_DEBOUNCE_MS = 3000` ms, `DFU_HOLD_THRESHOLD_MS = 10000` ms in [`src/main.c`](src/main.c)); see [Magnet gestures & LED feedback](#magnet-gestures--led-feedback) for the full reference.
+
+1. **Shelf mode is the default.** Devices ship in ultra-low-power **System OFF**: no LED, no radio, ~9 µA at the battery. Applying a magnet is the only way to wake.
+2. **Wake with a ~3 s magnet hold.** The LED lights **solid ON** the instant the magnet is sensed and drops **off at 3 s** as a "release now" commit cue. The device then enters connectable advertising with a **slow blink** (50 ms on / 450 ms off). Holds shorter than 3 s are rejected as false positives (a brush, RFID reader, or motor flyback cannot accidentally change state).
+3. **In Voleo, scan and connect.** The LED switches to **solid ON** for the duration of the BLE connection.
+4. **Time sync runs automatically; settings populate the app.** Voleo writes a timestamp on the Gateway characteristic, and the current device settings come back via the Node characteristic read. Tap **Push** to send any setting changes back.
+5. **Disconnect to enter production.** On a clean disconnect after time sync, the device blinks **5×**, the LED turns off, and production starts (vitals, scan/advertise schedule, NOR logging). The LED is **off** throughout production.
+6. **Return to shelf during production with a ~3 s magnet hold.** LED **solid ON** on apply → **off at 3 s** commit cue → **5× blink** → 5 s grace period → **one short confirmation blink** → device powers off into shelf mode (System OFF). A `shelf_entry` row is appended to JXS before power-off.
+7. **Hold ≥ 10 s only to enter firmware update (DFU) mode.** Past the 3 s commit cue the LED stays off; at 10 s the device emits **3× blink** then **fast blink** (50 ms on / 50 ms off) and starts MCUboot SMP BLE advertising for nRF Device Manager. A subsequent confirmed 3 s magnet hold returns to shelf. Release the magnet between 3 s and 10 s if you only want to wake the device, not enter DFU.
+
 ## Build and flash
 
 ```bash
@@ -240,7 +252,7 @@ This is distinct from **slow blink** (datetime sync) and **fast blink** (DFU).
 
 ---
 
-## Magnet Gesture Reference
+## Magnet gestures & LED feedback
 
 Every magnet detection site now requires a confirmed **3 s minimum hold**
 (`MAGNET_DEBOUNCE_MS` in [`src/main.c`](src/main.c)). Sub-3 s touches are

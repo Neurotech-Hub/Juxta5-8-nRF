@@ -13,10 +13,13 @@
 
 #include "juxta_time.h"
 
-/* DIAGNOSTIC BUILD: LOG_LEVEL_DBG so the flash_append / append entry-exit
- * brackets fire.  The module has no other LOG_DBG callsites, so raising the
- * level only enables the new bug-hunt instrumentation. */
-LOG_MODULE_REGISTER(juxta_log, LOG_LEVEL_DBG);
+/* Production: LOG_LEVEL_INF.  The per-chunk DBG instrumentation in
+ * flash_append produced ~one log line per 256 B of NOR write, which under
+ * CONFIG_LOG_MODE_IMMEDIATE + the previous BLOCK_IF_FIFO_FULL RTT mode
+ * could stall the BT RX / system workqueue thread for hundreds of ms per
+ * burst (and indefinitely with no host attached).  Raise temporarily to
+ * LOG_LEVEL_DBG only when actively chasing a NOR-append issue. */
+LOG_MODULE_REGISTER(juxta_log, LOG_LEVEL_INF);
 
 #define FLASH_NODE DT_ALIAS(spi_mem)
 
@@ -49,6 +52,31 @@ static const struct log_region regions[] = {
 /* YYYYMMDD for which all three log types have been aligned (see touch_all_for_calendar_day). */
 static char s_log_calendar_ymd[9];
 
+/* Long-op tick hook (see juxta_log_set_long_op_tick in juxta_log.h). */
+static void (*s_long_op_tick)(void);
+
+void juxta_log_set_long_op_tick(void (*tick)(void))
+{
+	s_long_op_tick = tick;
+}
+
+/* Single recursive-style mutex guarding every public juxta_log_* entry
+ * point.  Zephyr's k_mutex is already recursive (counts re-locks by the
+ * owning thread), so juxta_log_init -> juxta_log_format -> erase_region
+ * paths self-nest safely.  Today this is latent-race insurance: production
+ * is non-connectable so BT RX never touches the log concurrently with the
+ * system workqueue.  But the moment any path is added where two threads
+ * can both reach a juxta_log_* call (e.g. re-enabling
+ * JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV), the shared static buffers
+ * (chunk[], row[], header[], find_eof_or_erased buf[]) and the
+ * ctx->files[]/file_count mutations become torn-read/torn-write hazards
+ * that produce out-of-bounds indexing with no warning.  The mutex closes
+ * that door cheaply. */
+K_MUTEX_DEFINE(s_log_mutex);
+
+#define LOG_LOCK() (void)k_mutex_lock(&s_log_mutex, K_FOREVER)
+#define LOG_UNLOCK() (void)k_mutex_unlock(&s_log_mutex)
+
 /* Cached device identifier, populated by juxta_log_init().  ensure_file() uses
  * this to format the JXS `day_start` row on new-file creation without needing
  * to thread device_id through every vitals/BLE-observation append. */
@@ -65,6 +93,26 @@ static const struct log_region *region_for_type(enum juxta_log_type type)
 	}
 	return NULL;
 }
+
+/* Index into `regions[]` (and into ctx->region_full[]) for a log type.
+ * Returns -1 for an unknown type; callers that have already validated
+ * the type via region_for_type() can treat that case as defensive. */
+static int region_index_for_type(enum juxta_log_type type)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(regions); i++)
+	{
+		if (regions[i].type == type)
+		{
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+/* One-shot WARN when the file-slot table fills up.  Without this guard the
+ * ensure_file() short-circuit below would be silent forever.  Cleared by
+ * juxta_log_format() so a clearMemory rearms the warning. */
+static bool s_file_count_cap_warned;
 
 static int flash_read_u8(const struct juxta_log_context *ctx, uint32_t off, uint8_t *value)
 {
@@ -106,6 +154,13 @@ static int first_erased_offset(const struct juxta_log_context *ctx, const struct
 	return 0;
 }
 
+/* Worst-case per-region utilisation.  The previous implementation summed
+ * `used`/`cap` across all three regions, but because JXB occupies ~75 % of
+ * the chip a fully-saturated JXV or JXS only nudged the aggregate by a few
+ * points — the gateway never saw a meaningful "full" warning before data
+ * started being dropped.  Returning the max means a single region hitting
+ * 100 % surfaces immediately in the Node JSON, matching the user-visible
+ * "memory full" semantics expected by the iOS app. */
 uint8_t juxta_log_memory_level_percent(const struct juxta_log_context *ctx)
 {
 	if (!ctx || !ctx->initialized || !ctx->flash)
@@ -113,34 +168,44 @@ uint8_t juxta_log_memory_level_percent(const struct juxta_log_context *ctx)
 		return 0U;
 	}
 
-	uint64_t used = 0U;
-	uint64_t cap = 0U;
+	LOG_LOCK();
+
+	uint8_t worst = 0U;
 
 	for (size_t i = 0; i < ARRAY_SIZE(regions); i++)
 	{
+		/* A latched region is, by definition, full from the gateway's
+		 * perspective even if the very last bytes happen to be 0xFF. */
+		if (ctx->region_full[i])
+		{
+			worst = 100U;
+			continue;
+		}
+
 		uint32_t off;
 		int rc = first_erased_offset(ctx, &regions[i], &off);
 
 		if (rc != 0)
 		{
-			return 0U;
+			continue;
 		}
-		if (off < regions[i].start)
+		if (off < regions[i].start || regions[i].size == 0U)
 		{
 			continue;
 		}
-		used += (uint64_t)(off - regions[i].start);
-		cap += (uint64_t)regions[i].size;
+
+		uint64_t used = (uint64_t)(off - regions[i].start);
+		uint64_t pct = used * 100ULL / (uint64_t)regions[i].size;
+		uint8_t p = (pct > 100ULL) ? 100U : (uint8_t)pct;
+
+		if (p > worst)
+		{
+			worst = p;
+		}
 	}
 
-	if (cap == 0U)
-	{
-		return 0U;
-	}
-
-	uint64_t pct = used * 100ULL / cap;
-
-	return (pct > 100ULL) ? 100U : (uint8_t)pct;
+	LOG_UNLOCK();
+	return worst;
 }
 
 static int flash_append(struct juxta_log_context *ctx, uint32_t off, const void *data, size_t len)
@@ -157,8 +222,6 @@ static int flash_append(struct juxta_log_context *ctx, uint32_t off, const void 
 		wbs = 1U;
 	}
 
-	LOG_DBG("flash_append: enter off=0x%06x len=%u wbs=%u", off, (unsigned)len, (unsigned)wbs);
-
 	while (done < len)
 	{
 		size_t payload = MIN(len - done, sizeof(chunk));
@@ -173,22 +236,55 @@ static int flash_append(struct juxta_log_context *ctx, uint32_t off, const void 
 		memset(chunk, 0xFF, sizeof(chunk));
 		memcpy(chunk, src + done, payload);
 
-		LOG_DBG("flash_append: write enter off=0x%06x wlen=%u (chunk %u/%u)",
-				off + (uint32_t)done, (unsigned)write_len, (unsigned)done, (unsigned)len);
 		int rc = flash_write(ctx->flash, off + done, chunk, write_len);
-		LOG_DBG("flash_append: write exit rc=%d", rc);
 		if (rc != 0)
 		{
-			LOG_DBG("flash_append: exit rc=%d (early, after %u of %u)",
-					rc, (unsigned)done, (unsigned)len);
 			return rc;
 		}
 
 		done += payload;
 	}
 
-	LOG_DBG("flash_append: exit rc=0 (wrote %u)", (unsigned)len);
 	return 0;
+}
+
+/* Bounds-checked wrapper around flash_append.  Returns -ENOSPC (without
+ * touching the flash) when:
+ *   • the region's full-latch is already set, OR
+ *   • the write would cross the region's end boundary.
+ * In the boundary case the latch is set as a side effect so subsequent
+ * appends to the same region short-circuit without re-running the bounds
+ * arithmetic.  This is the single chokepoint that enforces the "stop
+ * writing when full" invariant for every NOR-touching path: append_row,
+ * append_jxs_day_start_row, the #EOF close in ensure_file, and the header
+ * write in ensure_file. */
+static int guarded_flash_append(struct juxta_log_context *ctx,
+				const struct log_region *region, int region_idx,
+				uint32_t off, const void *data, size_t len)
+{
+	if (!region || region_idx < 0 || region_idx >= (int)ARRAY_SIZE(regions))
+	{
+		return -EINVAL;
+	}
+	if (ctx->region_full[region_idx])
+	{
+		return -ENOSPC;
+	}
+
+	uint32_t region_end = region->start + region->size;
+
+	if (off < region->start || off > region_end || (uint64_t)off + (uint64_t)len > (uint64_t)region_end)
+	{
+		if (!ctx->region_full[region_idx])
+		{
+			LOG_WRN("Region %s full: would write %u bytes at 0x%06x (end 0x%06x); latching",
+				region->prefix, (unsigned)len, off, region_end);
+		}
+		ctx->region_full[region_idx] = true;
+		return -ENOSPC;
+	}
+
+	return flash_append(ctx, off, data, len);
 }
 
 static int add_file_entry(struct juxta_log_context *ctx, const char *path, uint32_t offset,
@@ -449,17 +545,22 @@ int juxta_log_recover_files(struct juxta_log_context *ctx)
 		return -EINVAL;
 	}
 
+	LOG_LOCK();
+
 	ctx->file_count = 0;
 	ctx->active_jxs = UINT32_MAX;
 	ctx->active_jxv = UINT32_MAX;
 	ctx->active_jxb = UINT32_MAX;
 
+	int rc = 0;
+
 	for (size_t i = 0; i < ARRAY_SIZE(regions); i++)
 	{
-		int rc = recover_region(ctx, &regions[i]);
+		rc = recover_region(ctx, &regions[i]);
 
 		if (rc != 0)
 		{
+			LOG_UNLOCK();
 			return rc;
 		}
 	}
@@ -468,6 +569,7 @@ int juxta_log_recover_files(struct juxta_log_context *ctx)
 	cache_from_context(ctx, &cache);
 	(void)juxta_settings_save_log_cache(&cache);
 	LOG_INF("Recovered %u NOR CSV pseudo-files", ctx->file_count);
+	LOG_UNLOCK();
 	return 0;
 }
 
@@ -485,6 +587,8 @@ static int append_jxs_day_start_row(struct juxta_log_context *ctx,
 	static char row[256];
 	int len;
 	int rc;
+	const struct log_region *region;
+	int region_idx;
 
 	if (!ctx || !settings || ctx->active_jxs == UINT32_MAX ||
 	    ctx->active_jxs >= ctx->file_count)
@@ -505,6 +609,20 @@ static int append_jxs_day_start_row(struct juxta_log_context *ctx,
 		return -EINVAL;
 	}
 
+	region = region_for_type(JUXTA_LOG_JXS);
+	region_idx = region_index_for_type(JUXTA_LOG_JXS);
+	if (!region || region_idx < 0)
+	{
+		return -EINVAL;
+	}
+	/* Silently no-op when the JXS region has already been latched full.
+	 * The caller (ensure_file) already wrote the header successfully; the
+	 * missing day_start row is a minor data loss but is not corruption. */
+	if (ctx->region_full[region_idx])
+	{
+		return 0;
+	}
+
 	len = snprintf(row, sizeof(row), "%u,day_start,%s,%s,%s,%s,%u,%u,%u,%s\n",
 		       unix_time, s_device_id, settings->subject_id, settings->experiment,
 		       JUXTA_FIRMWARE_VERSION, settings->scan_interval_s,
@@ -514,7 +632,14 @@ static int append_jxs_day_start_row(struct juxta_log_context *ctx,
 		return -ENOSPC;
 	}
 
-	rc = flash_append(ctx, entry->offset + entry->length, row, (size_t)len);
+	rc = guarded_flash_append(ctx, region, region_idx,
+				  entry->offset + entry->length, row, (size_t)len);
+	if (rc == -ENOSPC)
+	{
+		/* Latch set by guarded_flash_append; treat the missing day_start
+		 * row as a soft drop so ensure_file does not unwind the new file. */
+		return 0;
+	}
 	if (rc != 0)
 	{
 		return rc;
@@ -529,11 +654,12 @@ static int ensure_file(struct juxta_log_context *ctx, enum juxta_log_type type,
 {
 	const struct log_region *region = region_for_type(type);
 	uint32_t *active_slot = active_slot_for_type(ctx, type);
+	int region_idx = region_index_for_type(type);
 	static char date[9];
 	static char filename[JUXTA_FILE_NAME_LEN];
 	static char prefix[4];
 
-	if (!region || !active_slot || !settings)
+	if (!region || !active_slot || !settings || region_idx < 0)
 	{
 		return -EINVAL;
 	}
@@ -541,6 +667,14 @@ static int ensure_file(struct juxta_log_context *ctx, enum juxta_log_type type,
 	/* Clock not yet set — keep using the existing active file if there is one,
 	 * or skip creation entirely.  Rows with unix_time == 0 are meaningless. */
 	if (unix_time == 0U)
+	{
+		return 0;
+	}
+
+	/* Region full latch: do not touch this region at all (no close, no
+	 * header write, no rotation).  Returning 0 lets touch_all_for_calendar_day
+	 * continue rotating the other (non-full) regions normally. */
+	if (ctx->region_full[region_idx])
 	{
 		return 0;
 	}
@@ -555,19 +689,25 @@ static int ensure_file(struct juxta_log_context *ctx, enum juxta_log_type type,
 		return 0;
 	}
 
-	if (*active_slot != UINT32_MAX && *active_slot < ctx->file_count &&
-		ctx->files[*active_slot].active)
+	/* ----------------------------------------------------------------
+	 * Preconditions checked BEFORE any NOR write.  This is the fix for
+	 * the "orphan header" leak: with the old order, a successful header
+	 * flash_append could be followed by an -ENOSPC from add_file_entry,
+	 * leaving an untracked header on NOR that the per-vitals-tick retry
+	 * loop would rewrite forever.  Now we either commit the full rotation
+	 * (close + header + add_file_entry [+ day_start row]) or we do
+	 * nothing.
+	 * -------------------------------------------------------------- */
+	if (ctx->file_count >= JUXTA_MAX_FILES)
 	{
-		struct juxta_file_entry *old = &ctx->files[*active_slot];
-		int rc = flash_append(ctx, old->offset + old->length, EOF_MARKER,
-							  strlen(EOF_MARKER));
-
-		if (rc != 0)
+		if (!s_file_count_cap_warned)
 		{
-			return rc;
+			s_file_count_cap_warned = true;
+			LOG_WRN("ensure_file: file slot cap reached (%u/%u); further "
+				"rotations disabled until clearMemory",
+				(unsigned)ctx->file_count, JUXTA_MAX_FILES);
 		}
-		old->length += strlen(EOF_MARKER);
-		old->active = false;
+		return 0;
 	}
 
 	uint32_t off;
@@ -578,7 +718,13 @@ static int ensure_file(struct juxta_log_context *ctx, enum juxta_log_type type,
 	}
 	if (off >= region->start + region->size)
 	{
-		return -ENOSPC;
+		/* The region's erased tail is gone — latch full and no-op.  Callers
+		 * keep working on other regions; row writes targeted at this
+		 * region will be dropped by append_row's latch check. */
+		ctx->region_full[region_idx] = true;
+		LOG_WRN("Region %s exhausted (off=0x%06x end=0x%06x); latching",
+			region->prefix, off, region->start + region->size);
+		return 0;
 	}
 
 	static char header[160];
@@ -588,7 +734,54 @@ static int ensure_file(struct juxta_log_context *ctx, enum juxta_log_type type,
 		return -ENOSPC;
 	}
 
-	rc = flash_append(ctx, off, header, (size_t)header_len);
+	/* Bounds-check the new file's header + an estimated worst-case
+	 * day_start row (~256 B) before committing.  This keeps the rotation
+	 * "atomic": if there is not enough physical room left we never close
+	 * the old file, never write a half-rotated state.  Both writes still
+	 * go through guarded_flash_append below for defence in depth. */
+	const uint32_t needed_bytes = (uint32_t)header_len +
+		((type == JUXTA_LOG_JXS) ? 256U : 0U);
+	if ((uint64_t)off + (uint64_t)needed_bytes > (uint64_t)(region->start + region->size))
+	{
+		ctx->region_full[region_idx] = true;
+		LOG_WRN("Region %s would overflow on rotation (need %u at 0x%06x, end 0x%06x); latching",
+			region->prefix, (unsigned)needed_bytes, off, region->start + region->size);
+		return 0;
+	}
+
+	/* ----------------------------------------------------------------
+	 * Commit the rotation: close old (if any), write new header,
+	 * register the new entry, optionally append the JXS day_start row,
+	 * persist the cache.
+	 * -------------------------------------------------------------- */
+	if (*active_slot != UINT32_MAX && *active_slot < ctx->file_count &&
+		ctx->files[*active_slot].active)
+	{
+		struct juxta_file_entry *old = &ctx->files[*active_slot];
+		rc = guarded_flash_append(ctx, region, region_idx,
+					  old->offset + old->length,
+					  EOF_MARKER, strlen(EOF_MARKER));
+		if (rc == -ENOSPC)
+		{
+			/* Latched by the guard.  Old file is left active (no EOF);
+			 * juxta_log_transfer_payload_bytes() handles active files
+			 * correctly without the EOF subtraction. */
+			return 0;
+		}
+		if (rc != 0)
+		{
+			return rc;
+		}
+		old->length += strlen(EOF_MARKER);
+		old->active = false;
+	}
+
+	rc = guarded_flash_append(ctx, region, region_idx, off, header, (size_t)header_len);
+	if (rc == -ENOSPC)
+	{
+		/* Pre-check above should have caught this — defensive only. */
+		return 0;
+	}
 	if (rc != 0)
 	{
 		return rc;
@@ -597,6 +790,8 @@ static int ensure_file(struct juxta_log_context *ctx, enum juxta_log_type type,
 	rc = add_file_entry(ctx, filename, off, (uint32_t)header_len, type, true);
 	if (rc != 0)
 	{
+		/* Cannot happen after the file_count pre-check above; treated as
+		 * a real I/O error and surfaced to the caller. */
 		return rc;
 	}
 
@@ -660,30 +855,53 @@ static int touch_all_for_calendar_day(struct juxta_log_context *ctx,
 static int append_row(struct juxta_log_context *ctx, enum juxta_log_type type, const char *row)
 {
 	uint32_t *slot = active_slot_for_type(ctx, type);
+	const struct log_region *region = region_for_type(type);
+	int region_idx = region_index_for_type(type);
 	struct juxta_file_entry *entry;
+	size_t row_len;
 	int rc;
 
 	if (!slot || *slot == UINT32_MAX || *slot >= ctx->file_count)
 	{
 		return -ENOENT;
 	}
+	if (!region || region_idx < 0)
+	{
+		return -EINVAL;
+	}
+
+	/* Region full latch: silently drop the row.  Returning 0 keeps the
+	 * caller's logging quiet and lets the device continue running with
+	 * the other (non-full) regions; the "memory full" status is surfaced
+	 * via juxta_log_memory_level_percent() instead of per-call rc spam. */
+	if (ctx->region_full[region_idx])
+	{
+		return 0;
+	}
 
 	entry = &ctx->files[*slot];
-	rc = flash_append(ctx, entry->offset + entry->length, row, strlen(row));
+	row_len = strlen(row);
+	rc = guarded_flash_append(ctx, region, region_idx,
+				  entry->offset + entry->length, row, row_len);
+	if (rc == -ENOSPC)
+	{
+		/* Latch set by the guard; treat the drop as a silent stop. */
+		return 0;
+	}
 	if (rc != 0)
 	{
 		return rc;
 	}
 
-	entry->length += strlen(row);
+	entry->length += (uint32_t)row_len;
 	/* Do NOT save the NVS log cache here.  The NVS sectors are 4 KB each
-	 * and the cache struct is ~520 bytes, so a sector fills after ~7 writes.
-	 * At one JXB row every 20 s that means an erase cycle every ~2.5 min —
-	 * the nRF52840 internal flash (10 k cycles) would fail in ~17 days.
-	 * Instead the cache is saved only in ensure_file() on file
-	 * creation/rotation (~once per calendar day per type).  juxta_log_init()
-	 * reconciles stale cached lengths by scanning each active file with
-	 * find_eof_or_erased() on every boot. */
+	 * and the cache struct is ~1.5 KB at JUXTA_MAX_FILES=48, so a sector
+	 * fills after ~2 writes.  At one JXB row every 20 s that means an
+	 * erase cycle every ~40 s — the nRF52840 internal flash (10 k cycles)
+	 * would fail in days.  Instead the cache is saved only in
+	 * ensure_file() on file creation/rotation (~once per calendar day per
+	 * type).  juxta_log_init() reconciles stale cached lengths by scanning
+	 * each active file with find_eof_or_erased() on every boot. */
 	return 0;
 }
 
@@ -697,6 +915,8 @@ int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *s
 	{
 		return -EINVAL;
 	}
+
+	LOG_LOCK();
 
 	/* Cache device_id so ensure_file() can format the JXS `day_start` row
 	 * on new-file creation without a new parameter on the vitals/BLE-observation
@@ -717,7 +937,8 @@ int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *s
 	if (!device_is_ready(ctx->flash))
 	{
 		LOG_ERR("SPI NOR is not ready");
-		return -ENODEV;
+		rc = -ENODEV;
+		goto out;
 	}
 
 	uint32_t now = juxta_time_now();
@@ -796,7 +1017,7 @@ int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *s
 		 * and production init writes the first data (same as the normal path). */
 		ctx->initialized = true;
 		rc = juxta_log_format(ctx);
-		return rc;
+		goto out;
 	}
 
 	ctx->initialized = true;
@@ -808,28 +1029,33 @@ int juxta_log_init(struct juxta_log_context *ctx, const struct juxta_settings *s
 	if (now == 0U)
 	{
 		LOG_INF("Clock not set — deferring NOR file creation until time sync");
-		return 0;
+		rc = 0;
+		goto out;
 	}
 
 	rc = ensure_file(ctx, JUXTA_LOG_JXS, settings, now);
 	if (rc != 0)
 	{
-		return rc;
+		goto out;
 	}
 	rc = ensure_file(ctx, JUXTA_LOG_JXV, settings, now);
 	if (rc != 0)
 	{
-		return rc;
+		goto out;
 	}
 	rc = ensure_file(ctx, JUXTA_LOG_JXB, settings, now);
 	if (rc != 0)
 	{
-		return rc;
+		goto out;
 	}
 
 	juxta_time_date_string(now, s_log_calendar_ymd);
 
-	return juxta_log_append_event(ctx, settings, device_id, "boot", now);
+	rc = juxta_log_append_event(ctx, settings, device_id, "boot", now);
+
+out:
+	LOG_UNLOCK();
+	return rc;
 }
 
 static int erase_region(struct juxta_log_context *ctx, const struct log_region *region)
@@ -853,6 +1079,20 @@ static int erase_region(struct juxta_log_context *ctx, const struct log_region *
 			return rc;
 		}
 		pos = page.start_offset + page.size;
+
+		/* Per-sector watchdog feed + yield.  Each 4 KB sector erase is
+		 * ~45 ms on this SPI NOR and the JXB region alone is ~3 MB
+		 * (~750 sectors → ~34 s of pure erase time).  Because the
+		 * periodic WDT feed runs on the same system workqueue as the
+		 * clearMemory handler, it cannot fire while we are looping
+		 * here; we must feed inline.  k_yield() also lets any other
+		 * higher-priority thread (BT RX servicing a disconnect, ISR
+		 * deferred work) make progress between sector erases. */
+		if (s_long_op_tick != NULL)
+		{
+			s_long_op_tick();
+		}
+		k_yield();
 	}
 
 	return 0;
@@ -869,13 +1109,18 @@ int juxta_log_format(struct juxta_log_context *ctx)
 		return -EINVAL;
 	}
 
+	LOG_LOCK();
+
+	int rc = 0;
+
 	for (size_t i = 0; i < ARRAY_SIZE(regions); i++)
 	{
-		int rc = erase_region(ctx, &regions[i]);
+		rc = erase_region(ctx, &regions[i]);
 
 		if (rc != 0)
 		{
 			LOG_ERR("Failed to erase region %s: %d", regions[i].prefix, rc);
+			LOG_UNLOCK();
 			return rc;
 		}
 	}
@@ -885,9 +1130,12 @@ int juxta_log_format(struct juxta_log_context *ctx)
 	ctx->active_jxs = UINT32_MAX;
 	ctx->active_jxv = UINT32_MAX;
 	ctx->active_jxb = UINT32_MAX;
+	memset(ctx->region_full, 0, sizeof(ctx->region_full));
 	s_log_calendar_ymd[0] = '\0';
+	s_file_count_cap_warned = false;
 
 	LOG_INF("NOR CSV regions erased — file creation deferred to next data write");
+	LOG_UNLOCK();
 	return 0;
 }
 
@@ -895,26 +1143,25 @@ int juxta_log_append_event(struct juxta_log_context *ctx, const struct juxta_set
 						   const char *device_id, const char *event, uint32_t unix_time)
 {
 	static char row[256];
+	int rc;
 
 	if (!ctx || !settings || !device_id || !event)
 	{
 		return -EINVAL;
 	}
 
-	LOG_DBG("append_event: enter t=%u event=%s", unix_time, event);
+	LOG_LOCK();
 
-	int rc = touch_all_for_calendar_day(ctx, settings, unix_time);
+	rc = touch_all_for_calendar_day(ctx, settings, unix_time);
 	if (rc != 0)
 	{
-		LOG_DBG("append_event: exit rc=%d (touch_all)", rc);
-		return rc;
+		goto out;
 	}
 
 	rc = ensure_file(ctx, JUXTA_LOG_JXS, settings, unix_time);
 	if (rc != 0)
 	{
-		LOG_DBG("append_event: exit rc=%d (ensure_file)", rc);
-		return rc;
+		goto out;
 	}
 
 	int len = snprintf(row, sizeof(row), "%u,%s,%s,%s,%s,%s,%u,%u,%u,%s\n", unix_time,
@@ -923,13 +1170,15 @@ int juxta_log_append_event(struct juxta_log_context *ctx, const struct juxta_set
 					   settings->adv_interval_s, settings->vitals_interval_s, device_id);
 	if (len < 0 || len >= (int)sizeof(row))
 	{
-		LOG_DBG("append_event: exit rc=-ENOSPC (snprintf)");
-		return -ENOSPC;
+		rc = -ENOSPC;
+		goto out;
 	}
 
 	LOG_INF("JXS[%u] %s", unix_time, event);
 	rc = append_row(ctx, JUXTA_LOG_JXS, row);
-	LOG_DBG("append_event: exit rc=%d", rc);
+
+out:
+	LOG_UNLOCK();
 	return rc;
 }
 
@@ -940,40 +1189,41 @@ int juxta_log_append_vitals(struct juxta_log_context *ctx, uint32_t unix_time, u
 	int volts = batt_mv / 1000;
 	int centivolts = (batt_mv % 1000) / 10;
 	int len;
+	int rc;
 
 	if (!ctx)
 	{
 		return -EINVAL;
 	}
 
-	LOG_DBG("append_vitals: enter t=%u motion=%u", unix_time, motion);
+	LOG_LOCK();
 
-	int rc = touch_all_for_calendar_day(ctx, juxta_settings_get(), unix_time);
+	rc = touch_all_for_calendar_day(ctx, juxta_settings_get(), unix_time);
 	if (rc != 0)
 	{
-		LOG_DBG("append_vitals: exit rc=%d (touch_all)", rc);
-		return rc;
+		goto out;
 	}
 
 	rc = ensure_file(ctx, JUXTA_LOG_JXV, juxta_settings_get(), unix_time);
 	if (rc != 0)
 	{
-		LOG_DBG("append_vitals: exit rc=%d (ensure_file)", rc);
-		return rc;
+		goto out;
 	}
 
 	len = snprintf(row, sizeof(row), "%u,%u,%d.%02d,%d\n", unix_time, motion, volts,
 				   centivolts, temp_c);
 	if (len < 0 || len >= (int)sizeof(row))
 	{
-		LOG_DBG("append_vitals: exit rc=-ENOSPC (snprintf)");
-		return -ENOSPC;
+		rc = -ENOSPC;
+		goto out;
 	}
 
 	LOG_INF("JXV[%u] motion=%u batt=%d.%02dV temp=%d", unix_time, motion, volts,
 			centivolts, temp_c);
 	rc = append_row(ctx, JUXTA_LOG_JXV, row);
-	LOG_DBG("append_vitals: exit rc=%d", rc);
+
+out:
+	LOG_UNLOCK();
 	return rc;
 }
 
@@ -981,39 +1231,40 @@ int juxta_log_append_ble_observation(struct juxta_log_context *ctx, uint32_t uni
 									 const char *observer_id, const char *peer_id, int8_t rssi)
 {
 	static char row[96];
+	int rc;
 
 	if (!ctx || !observer_id || !peer_id)
 	{
 		return -EINVAL;
 	}
 
-	LOG_DBG("append_ble: enter t=%u peer=%s", unix_time, peer_id);
+	LOG_LOCK();
 
-	int rc = touch_all_for_calendar_day(ctx, juxta_settings_get(), unix_time);
+	rc = touch_all_for_calendar_day(ctx, juxta_settings_get(), unix_time);
 	if (rc != 0)
 	{
-		LOG_DBG("append_ble: exit rc=%d (touch_all)", rc);
-		return rc;
+		goto out;
 	}
 
 	rc = ensure_file(ctx, JUXTA_LOG_JXB, juxta_settings_get(), unix_time);
 	if (rc != 0)
 	{
-		LOG_DBG("append_ble: exit rc=%d (ensure_file)", rc);
-		return rc;
+		goto out;
 	}
 
 	int len = snprintf(row, sizeof(row), "%u,%s,%s,%d\n", unix_time, observer_id, peer_id,
 					   rssi);
 	if (len < 0 || len >= (int)sizeof(row))
 	{
-		LOG_DBG("append_ble: exit rc=-ENOSPC (snprintf)");
-		return -ENOSPC;
+		rc = -ENOSPC;
+		goto out;
 	}
 
 	LOG_INF("JXB[%u] %s rssi=%d", unix_time, peer_id, rssi);
 	rc = append_row(ctx, JUXTA_LOG_JXB, row);
-	LOG_DBG("append_ble: exit rc=%d", rc);
+
+out:
+	LOG_UNLOCK();
 	return rc;
 }
 
@@ -1044,6 +1295,8 @@ int juxta_log_list_files(struct juxta_log_context *ctx, char *buffer, size_t buf
 		return -EINVAL;
 	}
 
+	LOG_LOCK();
+
 	/* Format: "name|size;name|size;EOF"
 	 * Each entry carries a trailing semicolon; "EOF" is appended with no
 	 * leading semicolon.  This matches the legacy juxta-ble wire format
@@ -1058,6 +1311,7 @@ int juxta_log_list_files(struct juxta_log_context *ctx, char *buffer, size_t buf
 
 		if (len < 0 || (size_t)len >= buffer_size - written)
 		{
+			LOG_UNLOCK();
 			return -ENOSPC;
 		}
 		written += (size_t)len;
@@ -1066,11 +1320,13 @@ int juxta_log_list_files(struct juxta_log_context *ctx, char *buffer, size_t buf
 	/* Append terminal "EOF" token. */
 	if (written + 3U >= buffer_size)
 	{
+		LOG_UNLOCK();
 		return -ENOSPC;
 	}
 	memcpy(buffer + written, "EOF", 4U); /* includes null terminator */
 	written += 3U;
 
+	LOG_UNLOCK();
 	return (int)written;
 }
 
@@ -1082,15 +1338,19 @@ int juxta_log_find_file(struct juxta_log_context *ctx, const char *path,
 		return -EINVAL;
 	}
 
+	LOG_LOCK();
+
 	for (uint16_t i = 0; i < ctx->file_count; i++)
 	{
 		if (strcmp(ctx->files[i].path, path) == 0)
 		{
 			*entry = ctx->files[i];
+			LOG_UNLOCK();
 			return 0;
 		}
 	}
 
+	LOG_UNLOCK();
 	return -ENOENT;
 }
 
@@ -1099,16 +1359,20 @@ int juxta_log_read_file(struct juxta_log_context *ctx, const struct juxta_file_e
 						size_t *bytes_read)
 {
 	uint32_t visible_len;
+	int rc = 0;
 
 	if (!ctx || !entry || !buffer || !bytes_read)
 	{
 		return -EINVAL;
 	}
 
+	LOG_LOCK();
+
 	visible_len = entry->length + (entry->active ? (uint32_t)strlen(EOF_MARKER) : 0U);
 	if (file_offset >= visible_len)
 	{
 		*bytes_read = 0;
+		LOG_UNLOCK();
 		return 0;
 	}
 
@@ -1116,10 +1380,11 @@ int juxta_log_read_file(struct juxta_log_context *ctx, const struct juxta_file_e
 	if (file_offset < entry->length)
 	{
 		size_t physical = MIN(to_read, entry->length - file_offset);
-		int rc = flash_read(ctx->flash, entry->offset + file_offset, buffer, physical);
+		rc = flash_read(ctx->flash, entry->offset + file_offset, buffer, physical);
 
 		if (rc != 0)
 		{
+			LOG_UNLOCK();
 			return rc;
 		}
 
@@ -1136,6 +1401,7 @@ int juxta_log_read_file(struct juxta_log_context *ctx, const struct juxta_file_e
 	}
 
 	*bytes_read = to_read;
+	LOG_UNLOCK();
 	return 0;
 }
 
@@ -1145,16 +1411,20 @@ int juxta_log_read_file_for_transfer(struct juxta_log_context *ctx,
 {
 	uint32_t payload;
 	uint32_t flash_abs;
+	int rc;
 
 	if (!ctx || !entry || !buffer || !bytes_read)
 	{
 		return -EINVAL;
 	}
 
+	LOG_LOCK();
+
 	payload = juxta_log_transfer_payload_bytes(entry);
 	if (file_offset >= payload)
 	{
 		*bytes_read = 0;
+		LOG_UNLOCK();
 		return 0;
 	}
 
@@ -1163,12 +1433,14 @@ int juxta_log_read_file_for_transfer(struct juxta_log_context *ctx,
 
 	flash_abs = entry->offset + skip + file_offset;
 
-	int rc = flash_read(ctx->flash, flash_abs, buffer, to_read);
+	rc = flash_read(ctx->flash, flash_abs, buffer, to_read);
 
 	if (rc != 0)
 	{
+		LOG_UNLOCK();
 		return rc;
 	}
 	*bytes_read = to_read;
+	LOG_UNLOCK();
 	return 0;
 }
