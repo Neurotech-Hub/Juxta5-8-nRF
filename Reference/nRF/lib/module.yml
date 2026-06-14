@@ -1,0 +1,3 @@
+name: juxta_libs
+build:
+  kconfig: Kconfig

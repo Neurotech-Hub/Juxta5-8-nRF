@@ -1,0 +1,33 @@
+# JUXTA FRAM Library Configuration
+#
+# Copyright (c) 2024 NeurotechHub
+# SPDX-License-Identifier: Apache-2.0
+
+config JUXTA_FRAM
+	bool "JUXTA FRAM Library"
+	depends on SPI && GPIO
+	help
+	  Enable the JUXTA FRAM library for communicating with
+	  MB85RS1MT FRAM memory devices over SPI.
+	  
+	  This library provides a clean API for:
+	  - Device initialization and ID verification
+	  - Reading and writing data
+	  - Error handling and logging
+	  
+	  Requires SPI and GPIO drivers to be enabled.
+
+if JUXTA_FRAM
+
+module = JUXTA_FRAM
+module-str = juxta_fram
+source "subsys/logging/Kconfig.template.log_config"
+
+config JUXTA_FRAM_INIT_PRIORITY
+	int "JUXTA FRAM library initialization priority"
+	default 70
+	help
+	  Initialization priority for the JUXTA FRAM library.
+	  Must be higher than SPI and GPIO driver priorities.
+
+endif # JUXTA_FRAM 

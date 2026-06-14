@@ -1,0 +1,27 @@
+config JUXTA_FRAMFS
+	bool "JUXTA FRAM File System Library"
+	depends on JUXTA_FRAM
+	help
+	  Enable the JUXTA FRAM file system library. This provides a simple
+	  append-only file system on top of the JUXTA FRAM driver.
+
+if JUXTA_FRAMFS
+
+config JUXTA_FRAMFS_LOG_LEVEL
+	int "JUXTA FRAMFS Log Level"
+	default 3
+	range 0 4
+	help
+	  Sets log level for JUXTA FRAMFS library.
+	  0 = OFF, 1 = ERROR, 2 = WARNING, 3 = INFO, 4 = DEBUG
+
+config JUXTA_FRAMFS_FILENAME_LEN
+	int "Maximum filename length"
+	default 8
+	range 6 12
+	help
+	  Maximum length of filenames including null terminator.
+	  Default 8 supports YYMMDD format (6 chars + null).
+	  Must be a multiple of 4 for alignment.
+
+endif # JUXTA_FRAMFS 
