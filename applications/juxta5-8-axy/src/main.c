@@ -106,7 +106,7 @@ int main(void)
 		int16_t x_mg = 0;
 		int16_t y_mg = 0;
 		int16_t z_mg = 0;
-		int8_t temp_c = 0;
+		struct lis2dh12_temp_diag temp_diag = {0};
 		uint8_t int1_src = 0;
 		int magnet_state = gpio_pin_get_dt(&magnet);
 
@@ -121,7 +121,7 @@ int main(void)
 		}
 
 		ret = lis2dh12_zephyr_read_accel_mg(&lis2dh12, &x_mg, &y_mg, &z_mg);
-		ret |= lis2dh12_zephyr_read_temp_c(&lis2dh12, &temp_c);
+		ret |= lis2dh12_zephyr_read_temp_diag(&lis2dh12, &temp_diag);
 		ret |= lis2dh12_zephyr_read_int1_src(&lis2dh12, &int1_src);
 
 		if (ret < 0)
@@ -131,8 +131,17 @@ int main(void)
 		else
 		{
 			LOG_INF("AXY t=%u seq=%u motion_1s=%u x_mg=%d y_mg=%d z_mg=%d temp_c=%d mag=%d int1=0x%02x",
-					k_uptime_get_32(), sample_seq, period_motion, x_mg, y_mg, z_mg, temp_c,
-					magnet_state, int1_src);
+					k_uptime_get_32(), sample_seq, period_motion, x_mg, y_mg, z_mg,
+					temp_diag.temp_c, magnet_state, int1_src);
+			/* TEMP DIAG line — separate so the existing AXY line is
+			 * unchanged and any external log parser keeps working.
+			 * Healthy chip should show: whoami=0x33, temp_cfg=0xC0,
+			 * ctrl1 ODR bits ≠ 0, status_aux bit2 (TDA) toggling 1,
+			 * temp_h/temp_l moving with applied thermal load. */
+			LOG_INF("TEMP_DIAG t=%u temp_h=0x%02x temp_l=0x%02x lsb=%d status_aux=0x%02x temp_cfg=0x%02x ctrl1=0x%02x ctrl4=0x%02x whoami=0x%02x",
+					k_uptime_get_32(), temp_diag.temp_h, temp_diag.temp_l, temp_diag.lsb,
+					temp_diag.status_aux, temp_diag.temp_cfg, temp_diag.ctrl_reg1,
+					temp_diag.ctrl_reg4, temp_diag.whoami);
 		}
 
 		if (period_motion > 0U)

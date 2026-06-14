@@ -18,10 +18,7 @@ End-to-end user flow as orchestrated by the **Voleo iOS app**. Magnet timing is 
 
 ## Build and flash
 
-```bash
-west build -b Juxta5-8_nRF52840 applications/juxta5-8-prod
-west flash
-```
+The user will build/flash and report any issues. `west` commands are only built into the nRF Extension (VS Code/Cursor).
 
 RTT console is the primary runtime log (`CONFIG_USE_SEGGER_RTT=y`). Optional: enable JXGA opportunistic gateway advertising at compile time with `-DJUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=1` (see [Pending](#pending--not-yet-implemented)).
 
@@ -37,7 +34,7 @@ RTT console is the primary runtime log (`CONFIG_USE_SEGGER_RTT=y`). Optional: en
 | `experiment` | empty | Gateway `experiment` |
 | `upload_path` | `/` | Fixed placeholder in NVS blob |
 
-Firmware version **`5.8.1`**; NOR schema **`jxta-nor-csv-v5`** (`JUXTA_LOGGING_VERSION` 5).
+Firmware version **`5.8.2`**; NOR schema **`jxta-nor-csv-v5`** (`JUXTA_LOGGING_VERSION` 5).
 
 ---
 
@@ -314,7 +311,7 @@ Single JSON object. iOS reads this once on connect. Keys are **camelCase**. `fir
 
 ```json
 {
-  "firmwareVersion": "5.8.1",
+  "firmwareVersion": "5.8.2",
   "batteryLevel": 87,
   "memoryLevel": 12,
   "deviceId": "JX_9B10A1",
@@ -418,8 +415,8 @@ All regions are append-only CSV. Each pseudo-file is physically stored as:
 ```
 JXSYYYYMMDD.csv
 unix,event,device_id,subject_id,experiment,fw_version,scan_interval_s,adv_interval_s,vitals_interval_s,ble_name
-1715200000,day_start,JX_9B10A1,JX_9B10A1,,5.8.1,30,5,60,JX_9B10A1
-1715200000,boot,JX_9B10A1,JX_9B10A1,,5.8.1,30,5,60,JX_9B10A1
+1715200000,day_start,JX_9B10A1,JX_9B10A1,,5.8.2,30,5,60,JX_9B10A1
+1715200000,boot,JX_9B10A1,JX_9B10A1,,5.8.2,30,5,60,JX_9B10A1
 ```
 
 ```
