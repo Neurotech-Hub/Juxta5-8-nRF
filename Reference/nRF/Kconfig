@@ -1,0 +1,12 @@
+# JUXTA nRF Project Configuration
+#
+# Copyright (c) 2024 NeurotechHub
+# SPDX-License-Identifier: Apache-2.0
+
+# Source the libraries configuration
+source "lib/Kconfig"
+
+# Standard Zephyr configuration
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu 

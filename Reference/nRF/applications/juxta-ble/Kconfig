@@ -1,0 +1,30 @@
+# JUXTA BLE Application Configuration
+#
+# Copyright (c) 2024 NeurotechHub
+# SPDX-License-Identifier: Apache-2.0
+
+menu "JUXTA BLE Application"
+
+config JUXTA_BLE_RANDOMIZATION
+	bool "Enable randomization for BLE operations"
+	default y
+	help
+	  Enable randomization for BLE advertising and scanning intervals
+	  to reduce collision probability in dense deployments.
+
+config JUXTA_BLE_MOTION_GATING
+	bool "Enable motion-based BLE gating"
+	default y
+	help
+	  Enable motion-based gating that adjusts BLE intervals based on
+	  motion activity to save power.
+
+endmenu
+
+# Include Zephyr Kconfig
+source "Kconfig.zephyr"
+
+# Include library Kconfig files
+rsource "../../lib/juxta_vitals_nrf52/Kconfig"
+rsource "../../lib/juxta_fram/Kconfig"
+rsource "../../lib/juxta_framfs/Kconfig"

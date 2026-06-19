@@ -1,0 +1,35 @@
+sample:
+  name: JUXTA-AXY Accelerometer Example
+  description: >
+    Low-power accelerometer playground application for JUXTA-AXY boards.
+    Demonstrates LIS2DH12 accelerometer communication, magnet sensor interrupt,
+    and LED control. Based on juxta-mvp but focused on accelerometer functionality.
+
+common:
+  tags:
+    - accelerometer
+    - lis2dh12
+    - low-power
+    - interrupt
+    - spi
+    - gpio
+    - juxta
+
+tests:
+  applications.juxta-axy:
+    tags:
+      - accelerometer
+      - lis2dh12
+      - juxta
+    platform_allow:
+      - Juxta5-1_AXY
+    extra_configs:
+      - CONFIG_SPI=y
+      - CONFIG_GPIO=y
+      - CONFIG_LOG=y
+      - CONFIG_PM=y
+    harness: console
+    harness_config:
+      type: one_line
+      regex:
+        - "✅ LIS2DH12 WHO_AM_I verified: 0x33"

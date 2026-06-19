@@ -1,0 +1,10 @@
+identifier: Juxta5-1_AXY/nrf52805
+name: Juxta5-1_AXY
+vendor: NeurotechHub
+type: mcu
+arch: arm
+ram: 24
+flash: 192
+toolchain:
+  - zephyr
+supported: []

@@ -1,0 +1,26 @@
+# Vitals and Memory Implementation Guidelines
+
+1. FRAM Memory Operations:
+   - Use MB85RS1M FRAM chip
+   - Hardware layer: `juxta_fram` library
+   - File system layer: `juxta_framfs` library
+   - Follow library documentation for all operations
+
+2. Vitals Implementation (`juxta_vitals_nrf52`):
+   - Device Voltage:
+     - Use internal ADC
+     - Measure VDD
+   - RTC Operations:
+     - Accept unix timestamps for setting
+     - No direct BLE interaction
+     - Functions should default to passing RTC parameter
+     - Functions without RTC parameter are special cases
+
+3. File System Testing:
+   - Check file system statistics before operations
+   - Clear file system before fresh tests
+   - Monitor used and remaining space
+description:
+globs:
+alwaysApply: true
+---

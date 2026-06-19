@@ -1,0 +1,2 @@
+config BOARD_JUXTA5_1_AXY
+	select SOC_NRF52805_CAAA

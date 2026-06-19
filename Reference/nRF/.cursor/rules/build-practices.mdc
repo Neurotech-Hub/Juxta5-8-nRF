@@ -1,0 +1,15 @@
+# Build and Development Practices
+
+1. Never attempt to build applications or run build commands. The user exclusively builds using VS Code's nRF extension.
+2. Make minimal, incremental changes that can be quickly tested.
+3. Let the user handle all builds and testing.
+4. Never modify git state - only use git status and git diff for information.
+5. Always use RTT (Real Time Transfer) for debugging output - never use UART or other console methods.
+6. For complex problems:
+   - Present technical strategies first
+   - Ask clarifying questions before coding
+   - Break down into smaller testable units
+description:
+globs:
+alwaysApply: true
+---

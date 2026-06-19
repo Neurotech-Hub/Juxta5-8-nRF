@@ -1,0 +1,10 @@
+# Configuration file for nRF Connect SDK and testing tools
+sample:
+  description: Juxta BLE Application with LED Control
+  name: juxta-ble
+common:
+  build_only: true
+  integration_platforms:
+    - Juxta5-4_nRF52840
+tests:
+  app.default: {}

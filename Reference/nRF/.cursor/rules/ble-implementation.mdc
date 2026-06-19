@@ -1,0 +1,23 @@
+# BLE Implementation Guidelines
+
+1. Device Discovery:
+   - Observe other BLE devices
+   - Collect MAC addresses and RSSI values
+   - Filter for specific advertisement names: "JUXTA_XXXX"
+   - XXXX must be last four characters of device MAC
+
+2. Timing Requirements:
+   - Fixed rate advertising
+   - Duty-cycled observation (e.g., 5s scan every 30s)
+
+3. Gateway Connectivity:
+   - Devices must connect to gateway
+   - Gateway interaction for:
+     - Settings retrieval
+     - Data transfer
+
+4. Implementation References:
+   - Check `/samples/ble/` for reference implementations
+   - Particularly observer and peripheral examples
+alwaysApply: true
+---

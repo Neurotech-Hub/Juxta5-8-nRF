@@ -39,3 +39,6 @@ __pycache__/
 .venv/
 venv/
 /applications/juxta5-8-prod/debug
+/Reference/nRF/samples
+Reference/nRF/Juxta5.code-workspace
+Reference/C2939873.pdf

@@ -1,0 +1,20 @@
+# Copyright (c) 2024 NeurotechHub
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file is the application Kconfig entry point. All application Kconfig
+# options can be defined here or included via other application Kconfig files.
+# You can browse these options using the west targets menuconfig (terminal) or
+# guiconfig (GUI).
+
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+# Source library configurations
+rsource "../../lib/juxta_fram/Kconfig"
+rsource "../../lib/juxta_framfs/Kconfig"
+rsource "../../lib/juxta_vitals_nrf52/Kconfig"
+
+module = APP
+module-str = APP
+source "subsys/logging/Kconfig.template.log_config" 

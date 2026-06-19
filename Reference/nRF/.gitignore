@@ -1,0 +1,57 @@
+# Build directories
+build/
+**/build/
+**/build*/
+/twister-out*/
+
+# SDK components (they have their own git repos)
+/bootloader/
+/modules/
+/nrf/
+/nrfxlib/
+/test/
+/tools/
+/zephyr/
+
+# IDE and editor files
+.vscode/
+*.swp
+*.swo
+*~
+.idea/
+.west/
+
+# Python virtual environments
+venv/
+.venv/
+*.pyc
+__pycache__/
+
+# Build artifacts
+*.o
+*.d
+*.cmd
+*.log
+*.a
+*.bin
+*.hex
+*.map
+*.lst
+
+# Keep custom applications and boards
+!/applications/juxta-mvp/
+!/boards/NeurotechHub/
+
+# Debug artifacts
+/sanity-out*/
+.cache/
+compile_commands.json
+
+# macOS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db 

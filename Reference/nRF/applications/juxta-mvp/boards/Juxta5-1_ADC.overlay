@@ -1,0 +1,50 @@
+/*
+ * Board overlay for Juxta5-1_ADC specific configurations
+ * This file demonstrates how to use all the board peripherals
+ */
+
+/ {
+	chosen {
+		/* No UART available on this board */
+		zephyr,console = &uart0; /* Will be ignored since no UART */
+	};
+};
+
+/* Configure GPIO for magnet sensor interrupt */
+&gpio0 {
+	status = "okay";
+};
+
+/* Configure GPIOTE for interrupt handling */
+&gpiote {
+	status = "okay";
+};
+
+/* Configure ADC for differential measurement */
+&adc {
+	status = "okay";
+	
+	/* ADC channel 4 configured for differential measurement */
+	/* P0.04 (negative) and P0.05 (positive) */
+	#address-cells = <1>;
+	#size-cells = <0>;
+	
+	channel@4 {
+		reg = <4>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,input-positive = <NRF_SAADC_AIN4>; /* P0.04 */
+		zephyr,input-negative = <NRF_SAADC_AIN5>; /* P0.05 */
+		zephyr,resolution = <12>;
+		zephyr,oversampling = <8>;
+	};
+};
+
+/* Configure SPI for FRAM */
+&spi0 {
+	status = "okay";
+	
+	/* FRAM device is already configured in board DTS */
+	/* Access via device tree alias: spi-fram */
+}; 
