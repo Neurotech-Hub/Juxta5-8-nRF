@@ -363,7 +363,7 @@ JSON object; any subset of keys may be sent. Unrecognized keys are ignored. All 
 | ------------------------ | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `timestamp`              | uint32 Unix seconds | Sets device clock; appends `time_set` row to JXS                                                                                                  |
 | `sendFilenames`          | bool                | Triggers file listing indication on Filename characteristic                                                                                       |
-| `clearMemory`            | bool                | Erases all NOR CSV regions; fresh daily files on next write; appends `memory_cleared` to JXS; **does not clear NVS settings**                     |
+| `clearMemory`            | bool                | Erases all NOR CSV regions immediately; **does not** append a JXS row at erase time; fresh dated files on the next append (typically `boot` after sync-gate disconnect); **does not clear NVS settings** (see [clearMemory semantics](#clearmemory-semantics)) |
 | `reset`                  | bool                | Immediately enters shelf mode (System OFF in production; soft reboot in debug)                                                                    |
 | `scanInterval`           | integer (seconds)   | Stored in NVS: **0** = no passive scan bursts; otherwise **1–120**, any integer (out-of-range values clamped); appends `settings_changed` to JXS  |
 | `advInterval`            | integer (seconds)   | Stored in NVS: **0** = no non-connectable advertising; otherwise **1–120**, any integer (out-of-range values clamped); appends `settings_changed` |
@@ -372,6 +372,36 @@ JSON object; any subset of keys may be sent. Unrecognized keys are ignored. All 
 | `subjectId`              | string              | Subject assignment; stored in NVS; appends `settings_changed` to JXS                                                                              |
 | `experiment`             | string              | Experiment string; stored in NVS; appends `settings_changed` to JXS                                                                               |
 
+
+### clearMemory semantics
+
+`clearMemory` erases all NOR CSV regions (JXS, JXV, JXB) immediately. The erase
+runs on the system workqueue and may take several seconds.
+
+**No JXS row at erase time.** Provenance logging is deferred until the next NOR
+append (`juxta_log_format()` in [`src/juxta_log.c`](src/juxta_log.c) resets
+in-memory state only). When `clearMemory` is sent during the sync gate — before
+production — there is nothing useful to record at erase time: the prior session
+is intentionally discarded, and production entry marks the new package boundary.
+
+**NVS settings are preserved** (`subjectId`, `experiment`, intervals, etc.).
+
+**Recommended workflow:** finalize settings during the sync-gate connection, send
+`clearMemory`, then disconnect to enter production. The first post-erase JXS
+rows are typically:
+
+```text
+day_start          ← NVS snapshot (auto-emitted when the JXS file is created)
+user_disconnected  ← sync-gate handoff
+boot               ← production init
+```
+
+Fresh JXV/JXB files for the current calendar day are created on the first vitals
+or scan append after production starts.
+
+**During production:** `clearMemory` is honored but uncommon. The next vitals or
+lifecycle append recreates dated files; prior rows are gone with no separate
+erase marker in JXS.
 
 ---
 
@@ -450,7 +480,7 @@ Hardware + iOS session (also summarized in the repo [`README.md`](../../README.m
 5. Write a filename → File Transfer CSV stream (payload size matches listing) → final 3-byte `EOF` indication.
 6. Wait one vitals period → JXV grows. Open a new day's JXS (or after `clearMemory`) and confirm the file leads with a `day_start` row carrying the current NVS snapshot (subject, experiment, intervals). JXV/JXB carry only their column header and data rows (no `#device_settings` lines).
 7. Second `JX_XXXXXX` nearby during scan → JXB rows in RTT / NOR.
-8. Gateway `{"clearMemory":true}` → NOR erased, `memory_cleared` event; NVS settings unchanged on reconnect.
+8. Gateway `{"clearMemory":true}` during the sync-gate session (after finalizing settings, before disconnect) → all NOR CSV regions erased; **no JXS row at erase time**. Disconnect into production; JXS opens with `day_start` → `user_disconnected` → `boot`. NVS settings unchanged (reconnect and read Node).
 9. Power cycle → NVS settings and log cache reconcile without full NOR rescan.
 
 ---
@@ -572,7 +602,7 @@ applications/juxta5-8-prod/
 | Debugger simulation loop    | `CoreDebug->DHCSR` detects J-Link; simulates shelf/wake/DFU cycle in-band; `sys_reboot()` restarts loop                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | Vitals logging              | LIS2DH12 temperature, SAADC battery voltage, motion count → JXV; motion snapshot also drives inactivity **scan** interval multiplier                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | BLE observation logging     | `JX_XXXXXX` peer detection → JXB rows with observer/peer/rssi                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| JXS provenance rows         | `day_start`, `shelf_exit`, `user_connected`, `time_set`, `user_disconnected`, `boot`, `shelf_entry`, `settings_changed`, `memory_cleared`, `low_battery`, `wdt_recovery_dog`, `wdt_recovery_sreq`, `wdt_recovery_lockup`, `wdt_recovery_no_rtc` — together these read as a chronological device lifecycle: every new JXS pseudo-file opens with a `day_start` row (current NVS snapshot); each magnet wake produces a `shelf_exit`; each real BLE session is bracketed by `user_connected` / `user_disconnected`; each operator-initiated shelf return writes `shelf_entry` before power-off; each silent-reset recovery emits one `wdt_recovery_*` row right after `boot`. `time_set` is written every time the gateway supplies a clock value (e.g. once per sync-gate session) |
+| JXS provenance rows         | `day_start`, `shelf_exit`, `user_connected`, `time_set`, `user_disconnected`, `boot`, `shelf_entry`, `settings_changed`, `low_battery`, `wdt_recovery_dog`, `wdt_recovery_sreq`, `wdt_recovery_lockup`, `wdt_recovery_no_rtc` — together these read as a chronological device lifecycle: every new JXS pseudo-file opens with a `day_start` row (current NVS snapshot); each magnet wake produces a `shelf_exit`; each real BLE session is bracketed by `user_connected` / `user_disconnected`; each operator-initiated shelf return writes `shelf_entry` before power-off; each silent-reset recovery emits one `wdt_recovery_*` row right after `boot`. `time_set` is written every time the gateway supplies a clock value (e.g. once per sync-gate session). `clearMemory` does **not** append a row — see [clearMemory semantics](#clearmemory-semantics) |
 | File listing wire format    | `name\|size;name\|size;…` indication; listing **size** is CSV payload only (no filename line, no `#EOF`); transfer ends with 3-byte `EOF` indication on File Transfer                                                                                                                                                                                                                                                                                                                                                                                |
 | Day-start provenance        | Every new JXS pseudo-file leads with a `day_start` row (current NVS settings via the standard JXS columns: subject, experiment, intervals, ble_name). JXV/JXB stay strict CSV (header + data rows). Replaces the previous `#device_settings` JXV comment lines that broke single-header CSV parsing                                                                                                                                                                                                                                                       |
 | FUEL pin correction         | FUEL on P0.30/AIN6 (was incorrectly mapped to P0.28/AIN4 = AXY_INT2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |

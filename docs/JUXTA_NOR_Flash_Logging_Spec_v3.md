@@ -308,7 +308,6 @@ user_disconnected
 boot
 shelf_entry
 settings_changed
-memory_cleared
 low_battery
 wdt_recovery_dog
 wdt_recovery_sreq
@@ -338,6 +337,10 @@ shelf-wake → retrieve → production → magnet-shelf cycle:
 - `boot` — production init complete (timers and BLE state machine starting).
 - `shelf_entry` — operator held the magnet during production to enter shelf
   mode; written immediately before `enter_shelf_mode()`.
+- **Gateway `clearMemory`** — erases all NOR CSV regions; **not** emitted as a
+  JXS row. File creation and provenance are deferred to the next append
+  (`boot`, vitals, or lifecycle event). A sync-gate clear before production
+  is marked by the usual `day_start` → `user_disconnected` → `boot` sequence.
 - `wdt_recovery_dog` / `wdt_recovery_sreq` / `wdt_recovery_lockup` — emitted
   immediately after `boot` when the production recovery branch fired with a
   valid retained-RAM RTC snapshot. The suffix matches the bit observed in

@@ -178,7 +178,7 @@ See also the expanded checklist in [`applications/juxta5-8-prod/README.md`](appl
 6. Write a listed filename to the filename characteristic. File-transfer stream: CSV-only data indications (payload byte count equals listing **size**), then one final **`EOF`** (3-byte) indication — not `#EOF`/NOR terminator in the CSV payload.
 7. Allow device to run one vitals period (default **60 s**, NVS `vitals_interval_s` / Gateway `vitalsInterval`). RTT logs vitals; `JXV` byte count grows. JXV/JXB carry only their column header and data rows; the NVS snapshot lives in the JXS `day_start` row at the top of each day's JXS file.
 8. With another `JX_XXXXXX` device nearby, let a scan cycle complete. RTT logs peers; `JXB` rows are appended.
-9. Write `{"clearMemory":true}`. NOR regions erase and fresh CSV files are created with a `memory_cleared` event. Internal settings survive (reconnect, read Node; `subjectId` and `experiment` unchanged).
+9. Write `{"clearMemory":true}` during the sync-gate session (after finalizing settings, before disconnect). NOR regions erase immediately with **no JXS row at erase time**; disconnect into production and confirm JXS opens with `day_start` → `user_disconnected` → `boot`. NVS settings survive (reconnect, read Node; `subjectId` and `experiment` unchanged).
 10. Power cycle; RTT shows NVS settings reloaded and NOR log cache recovered without re-scanning flash.
 
 ### Later app validation placeholders
