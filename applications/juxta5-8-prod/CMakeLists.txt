@@ -13,6 +13,7 @@ target_sources(app PRIVATE
     src/main.c
     src/ble_service.c
     src/juxta_log.c
+    src/juxta_pof.c
     src/juxta_settings.c
     src/juxta_time.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../juxta5-8-axy/src/lis2dh12_zephyr.c

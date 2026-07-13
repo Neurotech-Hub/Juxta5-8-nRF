@@ -13,8 +13,12 @@ LOG_MODULE_REGISTER(juxta_settings, LOG_LEVEL_INF);
 #define SETTINGS_KEY_CURRENT "current"
 #define SETTINGS_KEY_LOG_CACHE "log_cache"
 #define SETTINGS_KEY_OP_MODE "op_mode"
+#define SETTINGS_KEY_BOOT_COUNT "boot_count"
+#define SETTINGS_KEY_BREADCRUMB "crumb"
 #define LOG_CACHE_MAGIC 0x4A584C43U /* JXLC */
 #define LOG_CACHE_VERSION 1U
+#define JUXTA_BREADCRUMB_MAGIC 0x4A584243U /* JXBC */
+#define JUXTA_BREADCRUMB_VERSION 1U
 
 static struct juxta_settings current_settings;
 static struct juxta_log_cache current_log_cache;
@@ -24,6 +28,9 @@ static bool loaded_log_cache;
  * setter runs so the cold-boot / first-flash path naturally lands in shelf. */
 static uint8_t current_op_mode = (uint8_t)JUXTA_OP_MODE_SHELF;
 static char boot_device_id[JUXTA_DEVICE_ID_LEN];
+static uint32_t current_boot_count;
+static struct juxta_breadcrumb current_breadcrumb;
+static bool loaded_breadcrumb;
 
 static void copy_string(char *dst, size_t dst_size, const char *src)
 {
@@ -51,6 +58,7 @@ void juxta_settings_defaults(struct juxta_settings *settings, const char *device
 	settings->vitals_interval_s = JUXTA_DEFAULT_VITALS_INTERVAL_S;
 	settings->adv_interval_s = JUXTA_DEFAULT_ADV_INTERVAL_S;
 	settings->inactivity_multiplier = JUXTA_DEFAULT_INACTIVITY_MULTIPLIER;
+	settings->motion_logging = 1U;
 }
 
 static int settings_set(const char *key, size_t len, settings_read_cb read_cb, void *cb_arg)
@@ -86,6 +94,48 @@ static int settings_set(const char *key, size_t len, settings_read_cb read_cb, v
 			current_log_cache.file_count <= JUXTA_MAX_FILES)
 		{
 			loaded_log_cache = true;
+		}
+		return (rc >= 0) ? 0 : rc;
+	}
+
+	if (strcmp(key, SETTINGS_KEY_BOOT_COUNT) == 0)
+	{
+		if (len != sizeof(current_boot_count))
+		{
+			LOG_WRN("Ignoring boot_count size %zu expected %zu", len,
+					sizeof(current_boot_count));
+			return -EINVAL;
+		}
+
+		uint32_t stored = 0U;
+		int rc = read_cb(cb_arg, &stored, sizeof(stored));
+		if (rc >= 0)
+		{
+			/* Keep the larger value: the early-boot increment may already
+			 * have bumped the RAM copy before the subtree load runs. */
+			if (stored > current_boot_count)
+			{
+				current_boot_count = stored;
+			}
+			return 0;
+		}
+		return rc;
+	}
+
+	if (strcmp(key, SETTINGS_KEY_BREADCRUMB) == 0)
+	{
+		if (len != sizeof(current_breadcrumb))
+		{
+			LOG_WRN("Ignoring breadcrumb size %zu expected %zu", len,
+					sizeof(current_breadcrumb));
+			return -EINVAL;
+		}
+
+		int rc = read_cb(cb_arg, &current_breadcrumb, sizeof(current_breadcrumb));
+		if (rc >= 0 && current_breadcrumb.magic == JUXTA_BREADCRUMB_MAGIC &&
+			current_breadcrumb.version == JUXTA_BREADCRUMB_VERSION)
+		{
+			loaded_breadcrumb = true;
 		}
 		return (rc >= 0) ? 0 : rc;
 	}
@@ -164,6 +214,15 @@ static void sanitize_settings(struct juxta_settings *settings)
 			settings->inactivity_multiplier = JUXTA_DEFAULT_INACTIVITY_MULTIPLIER;
 		}
 	}
+	if (settings->motion_logging > 1U)
+	{
+		settings->motion_logging = 1U;
+	}
+	else if (settings->motion_logging == 0U && settings->settings_reserved[0] == 0U)
+	{
+		/* Legacy NVS: this byte was settings_reserved[0] (always 0). */
+		settings->motion_logging = 1U;
+	}
 }
 
 int juxta_settings_init(const char *device_id)
@@ -201,11 +260,12 @@ int juxta_settings_init(const char *device_id)
 		sanitize_settings(&current_settings);
 	}
 
-	LOG_INF("settings subject=%s experiment=%s scan=%us adv=%us vitals=%us inactivity_multiplier=%u",
+	LOG_INF("settings subject=%s experiment=%s scan=%us adv=%us vitals=%us inactivity_multiplier=%u motion_logging=%u",
 			current_settings.subject_id, current_settings.experiment,
 			current_settings.scan_interval_s, current_settings.adv_interval_s,
 			current_settings.vitals_interval_s,
-			(unsigned int)current_settings.inactivity_multiplier);
+			(unsigned int)current_settings.inactivity_multiplier,
+			(unsigned int)current_settings.motion_logging);
 	return 0;
 }
 
@@ -325,4 +385,129 @@ int juxta_settings_set_op_mode(enum juxta_op_mode mode)
 	current_op_mode = next;
 	LOG_INF("op_mode := %u", next);
 	return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Boot counter + forensic breadcrumb
+ *
+ * Both must be usable *before* juxta_settings_init(): the fresh-boot and
+ * Step 3b battery-gate shelf entries run at the very top of main(), long
+ * before Step 7.  settings_subsys_init() is idempotent (-EALREADY on repeat
+ * calls) so each entry point below simply ensures it has run.
+ * -------------------------------------------------------------------------*/
+static int ensure_settings_subsys(void)
+{
+	int rc = settings_subsys_init();
+
+	if (rc != 0 && rc != -EALREADY)
+	{
+		LOG_ERR("settings_subsys_init failed: %d", rc);
+		return rc;
+	}
+	return 0;
+}
+
+/* Direct single-key loader used before the full subtree load has happened. */
+static int boot_count_direct_cb(const char *key, size_t len, settings_read_cb read_cb,
+								void *cb_arg, void *param)
+{
+	uint32_t *out = param;
+
+	ARG_UNUSED(key);
+	if (len == sizeof(*out))
+	{
+		(void)read_cb(cb_arg, out, sizeof(*out));
+	}
+	return 0;
+}
+
+int juxta_settings_boot_count_increment(void)
+{
+	int rc = ensure_settings_subsys();
+
+	if (rc != 0)
+	{
+		return rc;
+	}
+
+	uint32_t stored = 0U;
+
+	(void)settings_load_subtree_direct(SETTINGS_SUBTREE "/" SETTINGS_KEY_BOOT_COUNT,
+									   boot_count_direct_cb, &stored);
+	if (stored > current_boot_count)
+	{
+		current_boot_count = stored;
+	}
+
+	current_boot_count++;
+	rc = settings_save_one(SETTINGS_SUBTREE "/" SETTINGS_KEY_BOOT_COUNT,
+						   &current_boot_count, sizeof(current_boot_count));
+	if (rc != 0)
+	{
+		LOG_ERR("settings_save_one boot_count failed: %d", rc);
+		return rc;
+	}
+
+	LOG_INF("boot_count := %u", current_boot_count);
+	return 0;
+}
+
+uint32_t juxta_settings_boot_count(void)
+{
+	return current_boot_count;
+}
+
+int juxta_settings_save_breadcrumb(const struct juxta_breadcrumb *crumb)
+{
+	struct juxta_breadcrumb next;
+	int rc;
+
+	if (!crumb)
+	{
+		return -EINVAL;
+	}
+
+	rc = ensure_settings_subsys();
+	if (rc != 0)
+	{
+		return rc;
+	}
+
+	next = *crumb;
+	next.magic = JUXTA_BREADCRUMB_MAGIC;
+	next.version = JUXTA_BREADCRUMB_VERSION;
+
+	rc = settings_save_one(SETTINGS_SUBTREE "/" SETTINGS_KEY_BREADCRUMB, &next,
+						   sizeof(next));
+	if (rc != 0)
+	{
+		LOG_ERR("settings_save_one breadcrumb failed: %d", rc);
+		return rc;
+	}
+
+	current_breadcrumb = next;
+	loaded_breadcrumb = true;
+	return 0;
+}
+
+int juxta_settings_load_breadcrumb(struct juxta_breadcrumb *out)
+{
+	if (!out)
+	{
+		return -EINVAL;
+	}
+	if (!loaded_breadcrumb)
+	{
+		return -ENOENT;
+	}
+
+	*out = current_breadcrumb;
+	return 0;
+}
+
+int juxta_settings_clear_breadcrumb(void)
+{
+	memset(&current_breadcrumb, 0, sizeof(current_breadcrumb));
+	loaded_breadcrumb = false;
+	return settings_delete(SETTINGS_SUBTREE "/" SETTINGS_KEY_BREADCRUMB);
 }

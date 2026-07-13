@@ -14,7 +14,8 @@ struct juxta_settings
 	/* Same 16-byte footprint as legacy `settings_reserved[JUXTA_MODE_LEN]`. */
 	uint16_t adv_interval_s;   /* 0–JUXTA_MAX_BLE_INTERVAL_S; 0 = no periodic non-conn adv */
 	uint8_t inactivity_multiplier; /* 1–JUXTA_MAX_INACTIVITY_MULTIPLIER; scan interval only */
-	uint8_t settings_reserved[JUXTA_MODE_LEN - 3U];
+	uint8_t motion_logging;    /* 1 = count/log motion (default); 0 = ignore IRQ, JXV motion=0 */
+	uint8_t settings_reserved[JUXTA_MODE_LEN - 4U];
 	char upload_path[JUXTA_UPLOAD_PATH_LEN];
 	uint16_t scan_interval_s; /* 0–JUXTA_MAX_BLE_INTERVAL_S; 0 = no periodic passive scan */
 	uint16_t vitals_interval_s;
@@ -52,5 +53,35 @@ int juxta_settings_clear_log_cache(void);
  * cold-boot-to-shelf invariant when retained RAM is also empty. */
 enum juxta_op_mode juxta_settings_get_op_mode(void);
 int juxta_settings_set_op_mode(enum juxta_op_mode mode);
+
+/* Forensic breadcrumb: written at every shelf entry, consumed (emitted as a
+ * JXS row, then cleared) at the next boot that reaches a valid clock.  Kept
+ * in its own NVS key so it survives independently of the settings blob. */
+struct juxta_breadcrumb
+{
+	uint32_t magic;		/* JUXTA_BREADCRUMB_MAGIC */
+	uint8_t version;	/* JUXTA_BREADCRUMB_VERSION */
+	uint8_t reason;		/* enum juxta_shelf_reason */
+	uint8_t pof_hit;	/* 1 = POFCON fired during the life that shelved */
+	uint8_t _pad;
+	uint32_t resetreas; /* RESETREAS of the life that shelved */
+	uint32_t boot_count;
+	uint32_t unix_time; /* 0 if the clock was never set that life */
+	int32_t batt_mv;	/* last battery sample, 0 if none */
+};
+
+/* Monotonic boot counter (NVS).  Incremented exactly once per boot, before
+ * any shelf-entry branch can run, so even zero-trace lives are counted.
+ * Safe to call before juxta_settings_init(): initializes the settings
+ * subsystem itself and loads only its own key. */
+int juxta_settings_boot_count_increment(void);
+uint32_t juxta_settings_boot_count(void);
+
+/* Save is safe before juxta_settings_init() (fresh-boot / battery-gate shelf
+ * entries run before Step 7).  Load returns -ENOENT when no valid breadcrumb
+ * is stored. */
+int juxta_settings_save_breadcrumb(const struct juxta_breadcrumb *crumb);
+int juxta_settings_load_breadcrumb(struct juxta_breadcrumb *out);
+int juxta_settings_clear_breadcrumb(void);
 
 #endif /* JUXTA_SETTINGS_H_ */

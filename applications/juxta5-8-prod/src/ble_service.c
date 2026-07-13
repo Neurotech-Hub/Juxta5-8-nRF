@@ -1,6 +1,7 @@
 #include "ble_service.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -175,6 +176,41 @@ static bool extract_bool_true(const char *json, const char *key)
 				 strstr(p, " true") == p + strlen(pattern));
 }
 
+static int extract_bool(const char *json, const char *key, bool *value)
+{
+	char pattern[48];
+	const char *p;
+
+	if (!value)
+	{
+		return -EINVAL;
+	}
+
+	(void)snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+	p = strstr(json, pattern);
+	if (!p)
+	{
+		return -ENOENT;
+	}
+
+	p += strlen(pattern);
+	while (*p == ' ' || *p == '\t')
+	{
+		p++;
+	}
+	if (strncmp(p, "true", 4) == 0)
+	{
+		*value = true;
+		return 0;
+	}
+	if (strncmp(p, "false", 5) == 0)
+	{
+		*value = false;
+		return 0;
+	}
+	return -EINVAL;
+}
+
 static int generate_node_response(char *buffer, size_t buffer_size)
 {
 	char device_id[JUXTA_DEVICE_ID_LEN];
@@ -202,11 +238,13 @@ static int generate_node_response(char *buffer, size_t buffer_size)
 						   "\"experiment\":\"%s\","
 						   "\"advInterval\":%u,"
 						   "\"scanInterval\":%u,"
-						   "\"inactivityMultiplier\":%u}",
+						   "\"inactivityMultiplier\":%u,"
+						   "\"motionLogging\":%s}",
 						   JUXTA_FIRMWARE_VERSION, battery_level, memory_level, device_id,
 						   settings->subject_id, settings->experiment, settings->adv_interval_s,
 						   settings->scan_interval_s,
-						   (unsigned int)settings->inactivity_multiplier);
+						   (unsigned int)settings->inactivity_multiplier,
+						   settings->motion_logging != 0U ? "true" : "false");
 
 	if (written < 0 || written >= (int)buffer_size)
 	{
@@ -557,6 +595,17 @@ static int apply_gateway_command(const char *json)
 		changed = true;
 	}
 
+	{
+		bool motion_val;
+
+		if (extract_bool(json, "motionLogging", &motion_val) == 0)
+		{
+			next.motion_logging = motion_val ? 1U : 0U;
+			next.settings_reserved[0] = 1U;
+			changed = true;
+		}
+	}
+
 	if (changed)
 	{
 		int rc = juxta_settings_update(&next);
@@ -568,9 +617,10 @@ static int apply_gateway_command(const char *json)
 		const struct juxta_settings *a = juxta_settings_get();
 
 		LOG_INF("gateway settings saved: scan=%u adv=%u vitals=%u inactivity_multiplier=%u "
-				"subject=\"%s\" experiment=\"%s\"",
+				"motion_logging=%u subject=\"%s\" experiment=\"%s\"",
 				a->scan_interval_s, a->adv_interval_s, a->vitals_interval_s,
-				(unsigned int)a->inactivity_multiplier, a->subject_id, a->experiment);
+				(unsigned int)a->inactivity_multiplier,
+				(unsigned int)a->motion_logging, a->subject_id, a->experiment);
 		if (production_ready)
 		{
 			(void)juxta_log_append_event(log_ctx, a, device_id, "settings_changed",

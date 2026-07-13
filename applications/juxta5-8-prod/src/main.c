@@ -48,6 +48,7 @@
 
 #include "ble_service.h"
 #include "juxta_log.h"
+#include "juxta_pof.h"
 #include "juxta_prod.h"
 #include "juxta_settings.h"
 #include "juxta_time.h"
@@ -80,6 +81,12 @@ static const struct adc_dt_spec fuel = ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
  * LiPo tail); shelf below this to limit deep discharge. */
 #define BATT_BROWNOUT_MV 2750U /* Below this: immediate shelf mode */
 #define BATT_DFU_MIN_MV 3200U  /* Below this: DFU access denied   */
+/* Step 3b wake gate: require this many consecutive low samples, spaced a few
+ * ms apart, before shelving.  A single sample taken while VDD is still
+ * recovering from a transient droop must not shelve an otherwise-healthy
+ * device (crash analysis §5.5). */
+#define BATT_GATE_SAMPLES 3U
+#define BATT_GATE_SAMPLE_GAP_MS 5U
 
 /* LIS2DH12 motion interrupt — `lis2dh12_zephyr_config_motion()` (INT1_THS / INT1_DURATION). */
 #define LIS2DH12_MOTION_THRESHOLD_MG 16U
@@ -109,7 +116,7 @@ static struct k_work led_work;
 static struct k_timer led_timer;
 static struct k_work_delayable shelf_work;
 
-static void enter_shelf_mode(void);
+static void enter_shelf_mode(enum juxta_shelf_reason reason);
 
 static void led_timer_cb(struct k_timer *timer)
 {
@@ -187,7 +194,7 @@ static void enter_hw_fault_indication(const char *subsystem, int rc)
 static void shelf_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
-	enter_shelf_mode();
+	enter_shelf_mode(JUXTA_SHELF_REASON_GATEWAY_RESET);
 }
 
 /* Blocking blink sequence; stops any running LED mode first. */
@@ -392,7 +399,12 @@ static void prepare_for_shelf_mode(void);
  * what is effectively a "no return" function. */
 static atomic_t shelf_entry_claimed;
 
-static void enter_shelf_mode(void)
+/* RESETREAS captured (and cleared) once at the top of main() so every
+ * breadcrumb carries the reset cause of the life that is shelving — even
+ * from the battery gate, which runs before the boot-decision branch. */
+static uint32_t g_boot_resetreas;
+
+static void enter_shelf_mode(enum juxta_shelf_reason reason)
 {
 	if (!atomic_cas(&shelf_entry_claimed, 0, 1))
 	{
@@ -405,12 +417,34 @@ static void enter_shelf_mode(void)
 
 	bool debug = (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0U;
 
+	/* Forensic breadcrumb: persist why this life ended in NVS so the next
+	 * valid-clock boot can append a `crumb_<reason>` JXS row.  This is the
+	 * fix for the "silent shelf entries destroy all forensics" gap — a
+	 * field POR (fresh_boot) or battery-gate shelf is now attributable. */
+	{
+		struct juxta_breadcrumb crumb = {
+			.reason = (uint8_t)reason,
+			.pof_hit = juxta_pof_hit_this_life() ? 1U : 0U,
+			.resetreas = g_boot_resetreas,
+			.boot_count = juxta_settings_boot_count(),
+			.unix_time = juxta_time_now(),
+			.batt_mv = g_batt_mv,
+		};
+
+		(void)juxta_settings_save_breadcrumb(&crumb);
+		LOG_INF("Shelf breadcrumb: reason=%u rr=0x%08x n=%u mv=%ld pof=%u",
+				(unsigned int)reason, g_boot_resetreas,
+				juxta_settings_boot_count(), (long)g_batt_mv,
+				(unsigned int)crumb.pof_hit);
+	}
+
 	/* Persist op_mode := SHELF *before* the soft reboot / sys_poweroff() so a
 	 * later silent reset can never mistake this unit for one that was running
 	 * production.  Retained RAM is invalidated for the same reason: a clean
 	 * shelf entry must not look like a recoverable production boot. */
 	(void)juxta_settings_set_op_mode(JUXTA_OP_MODE_SHELF);
 	juxta_time_retained_invalidate();
+	juxta_pof_disarm();
 
 	k_sleep(K_MSEC(30)); /* flush RTT */
 
@@ -589,7 +623,7 @@ static void enter_dfu_mode(void)
 			set_led_mode(LED_MODE_OFF);
 			(void)bt_le_adv_stop();
 			k_sleep(K_MSEC(20));
-			enter_shelf_mode();
+			enter_shelf_mode(JUXTA_SHELF_REASON_DFU_EXIT);
 		}
 		k_sleep(K_MSEC(100));
 	}
@@ -611,6 +645,10 @@ static void accel_int_callback(const struct device *port, struct gpio_callback *
 	ARG_UNUSED(port);
 	ARG_UNUSED(cb);
 	ARG_UNUSED(pins);
+	if (juxta_settings_get()->motion_logging == 0U)
+	{
+		return;
+	}
 	motion_events++;
 	/* LOG_DBG is ISR-safe with Zephyr's deferred logger and won't appear
 	 * at the default INFO level — change log level to DEBUG to see per-event. */
@@ -664,6 +702,101 @@ static bool hardware_ready;
  * once the gateway has supplied a valid time. */
 static volatile bool pending_user_connected_log;
 static bool shelf_exit_logged_this_boot;
+/* boot + wdt_recovery_* rows are written at the *first valid-clock moment*
+ * (datetime sync or recovery-restored RTC), not at Step 9, so an offload
+ * during the sync connection always contains the current boot's identity
+ * (crash analysis §5.8).  This flag makes the write one-shot. */
+static bool boot_logged_this_boot;
+/* wdt_recovery_{dog,sreq,lockup,no_rtc} when this boot is a silent-reset
+ * recovery; NULL otherwise.  File-scope so the datetime-sync flush can emit
+ * it before the sync-session offload begins. */
+static const char *g_recovery_event;
+
+/* One-shot append of the current boot's identity rows: `boot`, then the
+ * wdt_recovery_* row when this boot is a recovery.  No-ops silently while
+ * the clock is unset (juxta_log_append_event drops unix_time == 0 rows). */
+static void log_boot_identity(void)
+{
+	uint32_t now = juxta_time_now();
+
+	if (boot_logged_this_boot || now == 0U)
+	{
+		return;
+	}
+	boot_logged_this_boot = true;
+
+	(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id, "boot", now);
+
+	/* Auditable recovery trail: a wdt_recovery_{dog,sreq,lockup,no_rtc}
+	 * row lands immediately after "boot" whenever the recovery branch
+	 * fired.  A unit with N of these rows in a day is immediately visible
+	 * to the gateway operator at the next offload. */
+	if (g_recovery_event != NULL)
+	{
+		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
+									 g_recovery_event, now);
+	}
+}
+
+/* One-shot emission of the forensic state carried over from the previous
+ * life: the NVS shelf breadcrumb (why/when the last life ended) and the
+ * retained-RAM POF witness (supply sag before an un-shelved reset).  Both
+ * are consumed after the JXS rows land so each is reported exactly once.
+ * The event strings contain no commas, so the JXS column layout is
+ * untouched — only new event names appear to downstream parsers. */
+static void emit_boot_forensics(void)
+{
+	static bool forensics_emitted;
+	uint32_t now = juxta_time_now();
+
+	if (forensics_emitted || now == 0U)
+	{
+		return;
+	}
+	forensics_emitted = true;
+
+	struct juxta_breadcrumb crumb;
+
+	if (juxta_settings_load_breadcrumb(&crumb) == 0)
+	{
+		static const char *const reason_names[] = {
+			"unknown",		  /* JUXTA_SHELF_REASON_UNKNOWN */
+			"fresh_boot",	  /* JUXTA_SHELF_REASON_FRESH_BOOT */
+			"batt_gate",	  /* JUXTA_SHELF_REASON_BATT_GATE */
+			"false_positive", /* JUXTA_SHELF_REASON_FALSE_POSITIVE */
+			"magnet",		  /* JUXTA_SHELF_REASON_MAGNET */
+			"dfu_exit",		  /* JUXTA_SHELF_REASON_DFU_EXIT */
+			"brownout",		  /* JUXTA_SHELF_REASON_BROWNOUT */
+			"gateway_reset",  /* JUXTA_SHELF_REASON_GATEWAY_RESET */
+		};
+		const char *reason = (crumb.reason < ARRAY_SIZE(reason_names))
+								 ? reason_names[crumb.reason]
+								 : "invalid";
+		char event[96];
+
+		(void)snprintf(event, sizeof(event),
+					   "crumb_%s rr=0x%08x n=%u mv=%d pof=%u t=%u", reason,
+					   crumb.resetreas, crumb.boot_count, (int)crumb.batt_mv,
+					   (unsigned int)crumb.pof_hit, crumb.unix_time);
+		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
+									 event, now);
+		(void)juxta_settings_clear_breadcrumb();
+	}
+
+	struct juxta_pof_witness pof;
+
+	if (juxta_pof_prev_life(&pof))
+	{
+		char event[96];
+
+		(void)snprintf(event, sizeof(event), "pof_witness n=%u up=%llds t=%u",
+					   pof.count, (long long)(pof.last_uptime_ms / 1000),
+					   pof.last_unix);
+		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
+									 event, now);
+		juxta_pof_prev_life_clear();
+	}
+}
 
 /* Forward declarations for BLE state — defined in the operational state machine
  * section below, but referenced earlier by vitals_work_handler. */
@@ -695,15 +828,23 @@ static void vitals_work_handler(struct k_work *work)
 	/* Motion counts LIS2DH12 events since the last vitals run (typically
 	 * vitals_interval_s, often 60 s). Used with inactivity_multiplier to stretch
 	 * the BLE scan cadence when there was no activity in that window. */
-	unsigned int key = irq_lock();
-	uint32_t raw_motion = motion_events;
+	uint16_t motion;
 
-	motion_events = 0U;
-	irq_unlock(key);
+	if (juxta_settings_get()->motion_logging != 0U)
+	{
+		unsigned int key = irq_lock();
+		uint32_t raw_motion = motion_events;
 
-	uint16_t motion = (uint16_t)MIN(raw_motion, 65535U);
-
-	last_vitals_period_zero_motion = (motion == 0U);
+		motion_events = 0U;
+		irq_unlock(key);
+		motion = (uint16_t)MIN(raw_motion, 65535U);
+		last_vitals_period_zero_motion = (motion == 0U);
+	}
+	else
+	{
+		motion = 0U;
+		last_vitals_period_zero_motion = false;
+	}
 	k_work_submit(&state_work);
 
 	/* Always read sensors to keep data fresh. */
@@ -744,7 +885,7 @@ static void vitals_work_handler(struct k_work *work)
 		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
 									 "low_battery", now);
 		k_sleep(K_MSEC(50)); /* allow NOR write to complete */
-		enter_shelf_mode();
+		enter_shelf_mode(JUXTA_SHELF_REASON_BROWNOUT);
 	}
 
 	/* Diagnostic: dump per-thread stack high-water marks + CPU stats to RTT.
@@ -1412,8 +1553,11 @@ void juxta_ble_datetime_synchronized(void)
 
 	/* The gateway has supplied a valid clock.  Flush any lifecycle rows
 	 * that were waiting for a usable timestamp.  Order matters so the
-	 * resulting JXS reads chronologically as: shelf_exit, user_connected,
-	 * time_set (written by the caller in ble_service.c). */
+	 * resulting JXS reads chronologically as: shelf_exit, boot (+ any
+	 * wdt_recovery_* row), user_connected, time_set (written by the
+	 * caller in ble_service.c).  Writing the boot identity here — rather
+	 * than at Step 9 after disconnect — means an offload during this
+	 * sync connection already contains the current boot's rows. */
 	uint32_t now = juxta_time_now();
 
 	if (!shelf_exit_logged_this_boot)
@@ -1422,6 +1566,9 @@ void juxta_ble_datetime_synchronized(void)
 		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
 									 "shelf_exit", now);
 	}
+
+	log_boot_identity();
+	emit_boot_forensics();
 
 	if (pending_user_connected_log)
 	{
@@ -1512,29 +1659,72 @@ int main(void)
 	k_timer_init(&led_timer, led_timer_cb, NULL);
 
 	/* ----------------------------------------------------------------
+	 * Step 3a: Capture RESETREAS *before* the battery gate so any
+	 * breadcrumb written by an early shelf entry carries the reset
+	 * cause of this life.  Also count the boot (NVS, monotonic) so
+	 * even zero-trace lives are countable at the next offload.
+	 * -------------------------------------------------------------- */
+	uint32_t resetreas = NRF_POWER->RESETREAS;
+	NRF_POWER->RESETREAS = resetreas; /* write-1-to-clear */
+	g_boot_resetreas = resetreas;
+
+	(void)juxta_settings_boot_count_increment();
+
+	/* Snapshot any POF witness the previous life left in retained RAM,
+	 * then re-arm the comparator for this life.  A supply sag from here
+	 * on is recorded even if it ends in a reset. */
+	juxta_pof_init();
+
+	/* ----------------------------------------------------------------
 	 * Step 3b: Early battery sample — needed before DFU gate and
 	 * brownout check which both occur before the main ADC init step.
 	 * Skip in debugger mode so a drained bench supply doesn't block
 	 * development workflows.
+	 *
+	 * The gate requires BATT_GATE_SAMPLES consistent low readings a few
+	 * ms apart before shelving: a single 14-bit SAADC sample taken while
+	 * VDD is still slewing after a transient droop/reset could otherwise
+	 * silently convert a recoverable glitch into a multi-hour outage.
 	 * -------------------------------------------------------------- */
 	bool debugger_early = (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0U;
 	if (!debugger_early && adc_is_ready_dt(&fuel))
 	{
 		(void)adc_channel_setup_dt(&fuel);
-		(void)sample_battery_mv();
-		if (g_batt_mv > 0U && g_batt_mv < BATT_BROWNOUT_MV)
+
+		uint8_t low_samples = 0U;
+
+		for (uint8_t i = 0U; i < BATT_GATE_SAMPLES; i++)
 		{
-			LOG_WRN("Battery critical at wake (%ld mV < %u mV) — shelf mode",
-					(long)g_batt_mv, BATT_BROWNOUT_MV);
-			enter_shelf_mode(); /* does not return */
+			(void)sample_battery_mv();
+			LOG_INF("Battery gate sample %u/%u: %ld mV", (unsigned int)(i + 1U),
+					(unsigned int)BATT_GATE_SAMPLES, (long)g_batt_mv);
+			if (g_batt_mv > 0 && g_batt_mv < BATT_BROWNOUT_MV)
+			{
+				low_samples++;
+			}
+			if (i < (BATT_GATE_SAMPLES - 1U))
+			{
+				k_sleep(K_MSEC(BATT_GATE_SAMPLE_GAP_MS));
+			}
+		}
+
+		if (low_samples == BATT_GATE_SAMPLES)
+		{
+			LOG_WRN("Battery critical at wake (%u/%u samples < %u mV, last %ld mV) — shelf mode",
+					(unsigned int)low_samples, (unsigned int)BATT_GATE_SAMPLES,
+					BATT_BROWNOUT_MV, (long)g_batt_mv);
+			enter_shelf_mode(JUXTA_SHELF_REASON_BATT_GATE); /* does not return */
+		}
+		else if (low_samples > 0U)
+		{
+			LOG_WRN("Battery gate: only %u/%u samples low — supply recovering, continuing boot",
+					(unsigned int)low_samples, (unsigned int)BATT_GATE_SAMPLES);
 		}
 	}
 
 	/* ----------------------------------------------------------------
-	 * Step 3: Check reset reason to determine boot path.
+	 * Step 3: Boot-path decision from the RESETREAS captured above.
 	 * -------------------------------------------------------------- */
-	uint32_t resetreas = NRF_POWER->RESETREAS;
-	NRF_POWER->RESETREAS = resetreas; /* write-1-to-clear */
 
 	/* CoreDebug DHCSR bit 0 (C_DEBUGEN) is set whenever a debugger has
 	 * enabled the debug interface (J-Link, SWD, etc.).  When active we skip
@@ -1556,7 +1746,6 @@ int main(void)
 	bool recovery_attempted = false;
 	bool recovery_full = false;
 	uint32_t recovery_unix = 0U;
-	const char *recovery_event = NULL;
 
 	LOG_INF("Boot: RESETREAS=0x%08x system_off=%d fresh=%d debugger=%d silent_reset=%d",
 			resetreas, (int)from_system_off, (int)fresh_boot, (int)debugger_active,
@@ -1636,7 +1825,7 @@ int main(void)
 		if (fresh_boot)
 		{
 			LOG_INF("Fresh power-on → shelf mode");
-			enter_shelf_mode(); /* does not return */
+			enter_shelf_mode(JUXTA_SHELF_REASON_FRESH_BOOT); /* does not return */
 		}
 
 		if (from_system_off)
@@ -1661,7 +1850,7 @@ int main(void)
 				LOG_INF("Magnet hold %lld ms < %u ms — false positive, returning to shelf",
 						(long long)hold_ms, MAGNET_DEBOUNCE_MS);
 				gpio_pin_set_dt(&led, 0);
-				enter_shelf_mode(); /* does not return */
+				enter_shelf_mode(JUXTA_SHELF_REASON_FALSE_POSITIVE); /* does not return */
 			}
 			else if (hold_ms >= (int64_t)DFU_HOLD_THRESHOLD_MS)
 			{
@@ -1746,20 +1935,24 @@ int main(void)
 		if (is_silent_reset && saved_mode == JUXTA_OP_MODE_PROD && !debugger_active)
 		{
 			recovery_attempted = true;
+			/* No magnet was involved in this boot: suppress the shelf_exit
+			 * row so recovery boots are not masked as user wakes in the
+			 * offloaded data (crash analysis §5.8). */
+			shelf_exit_logged_this_boot = true;
 			if (juxta_time_retained_valid())
 			{
 				recovery_unix = juxta_time_retained_unix();
 				recovery_full = true;
-				recovery_event = (resetreas & POWER_RESETREAS_DOG_Msk)		? "wdt_recovery_dog"
-								 : (resetreas & POWER_RESETREAS_LOCKUP_Msk) ? "wdt_recovery_lockup"
-																			: "wdt_recovery_sreq";
+				g_recovery_event = (resetreas & POWER_RESETREAS_DOG_Msk)	  ? "wdt_recovery_dog"
+								   : (resetreas & POWER_RESETREAS_LOCKUP_Msk) ? "wdt_recovery_lockup"
+																			  : "wdt_recovery_sreq";
 				juxta_time_set(recovery_unix);
 				LOG_INF("Recovery: RTC restored from retained RAM (unix=%u, event=%s)",
-						(unsigned)recovery_unix, recovery_event);
+						(unsigned)recovery_unix, g_recovery_event);
 			}
 			else
 			{
-				recovery_event = "wdt_recovery_no_rtc";
+				g_recovery_event = "wdt_recovery_no_rtc";
 				need_datetime_sync = true;
 				LOG_WRN("Recovery: retained RAM invalid — forcing datetime_sync");
 			}
@@ -1826,20 +2019,13 @@ int main(void)
 	k_timer_init(&rtc_checkpoint_timer, rtc_checkpoint_cb, NULL);
 	k_timer_start(&rtc_checkpoint_timer, K_SECONDS(1), K_SECONDS(1));
 
-	/* "boot" is the first NOR write — creates JXS for today's date.
-	 * Skipped silently if clock is still unset (ensure_file returns 0 for time == 0). */
-	(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
-								 "boot", juxta_time_now());
-
-	/* Auditable recovery trail: a wdt_recovery_{dog,sreq,lockup,no_rtc} row
-	 * lands in JXS immediately after "boot" whenever the recovery branch
-	 * fired.  A unit with N of these rows in a day is immediately visible
-	 * to the gateway operator at the next offload. */
-	if (recovery_event != NULL)
-	{
-		(void)juxta_log_append_event(&log_ctx, juxta_settings_get(), device_id,
-									 recovery_event, juxta_time_now());
-	}
+	/* Boot identity (boot + wdt_recovery_*) is normally written during the
+	 * sync gate the moment the clock became valid; this covers the full-
+	 * recovery path (retained RTC, no sync gate) and is a no-op when the
+	 * rows already landed.  Also the first valid-clock moment to emit the
+	 * forensic rows carried over from the previous life. */
+	log_boot_identity();
+	emit_boot_forensics();
 
 	k_work_init(&state_work, state_work_handler);
 	k_work_init(&vitals_work, vitals_work_handler);
@@ -1909,7 +2095,7 @@ int main(void)
 									 device_id, "shelf_entry",
 									 juxta_time_now());
 		k_sleep(K_SECONDS(5));
-		enter_shelf_mode(); /* does not return */
+		enter_shelf_mode(JUXTA_SHELF_REASON_MAGNET); /* does not return */
 	}
 
 	return 0;

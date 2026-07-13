@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define JUXTA_PRODUCT_NAME "Juxta5-8"
-#define JUXTA_FIRMWARE_VERSION "5.8.2"
+#define JUXTA_FIRMWARE_VERSION "5.8.3"
 #define JUXTA_LOG_SCHEMA "jxta-nor-csv-v5"
 #define JUXTA_LOGGING_VERSION 5
 
@@ -53,6 +53,22 @@ enum juxta_op_mode
 	JUXTA_OP_MODE_SHELF = 0, /* default — power-on, shelf, after magnet/gateway-driven exit */
 	JUXTA_OP_MODE_PROD = 1,	 /* production init completed; recovery target */
 	JUXTA_OP_MODE_DFU = 2,	 /* DFU mode entered */
+};
+
+/* Why the device entered shelf mode (System OFF).  Persisted in the NVS
+ * breadcrumb at every enter_shelf_mode() so the *next* valid-clock boot can
+ * append a `crumb_<reason>` JXS row — converting previously-silent shelf
+ * entries (fresh power-on, battery gate) into attributable events. */
+enum juxta_shelf_reason
+{
+	JUXTA_SHELF_REASON_UNKNOWN = 0,
+	JUXTA_SHELF_REASON_FRESH_BOOT = 1,	   /* RESETREAS == 0 (true power-on / battery insertion) */
+	JUXTA_SHELF_REASON_BATT_GATE = 2,	   /* Step 3b early battery gate (< brownout at wake) */
+	JUXTA_SHELF_REASON_FALSE_POSITIVE = 3, /* sub-debounce magnet hold on System OFF wake */
+	JUXTA_SHELF_REASON_MAGNET = 4,		   /* confirmed magnet hold during production */
+	JUXTA_SHELF_REASON_DFU_EXIT = 5,	   /* magnet hold in DFU monitor */
+	JUXTA_SHELF_REASON_BROWNOUT = 6,	   /* vitals-tick brownout (< brownout in production) */
+	JUXTA_SHELF_REASON_GATEWAY_RESET = 7,  /* gateway "reset" command */
 };
 
 #endif /* JUXTA_PROD_H_ */
