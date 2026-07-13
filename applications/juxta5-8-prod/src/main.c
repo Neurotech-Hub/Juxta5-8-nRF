@@ -672,9 +672,6 @@ typedef enum
 	BLE_STATE_IDLE = 0,
 	BLE_STATE_ADVERTISING,
 	BLE_STATE_SCANNING,
-#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
-	BLE_STATE_CONNECTABLE_ADV,
-#endif
 } ble_state_t;
 static ble_state_t ble_state;
 static struct k_work state_work;
@@ -785,16 +782,6 @@ typedef struct
 } scan_event_t;
 K_MSGQ_DEFINE(scan_event_q, sizeof(scan_event_t), SCAN_EVENT_QUEUE_SIZE, 4);
 
-/* Opportunistic connectable advertising after overhearing JXGA_* in scan (only after
- * ProductionInit). Set to 1 to re-enable. */
-#ifndef JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
-#define JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV 0
-#endif
-
-#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
-static bool do_gateway_adv;
-#endif
-
 static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
 					struct net_buf_simple *ad)
 {
@@ -843,15 +830,7 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
 		(void)snprintf(evt.peer_id, sizeof(evt.peer_id), "%s", dev_name);
 		evt.rssi = rssi;
 		(void)k_msgq_put(&scan_event_q, &evt, K_NO_WAIT);
-#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
 	}
-	else if (strncmp(dev_name, "JXGA_", 5) == 0)
-	{
-		do_gateway_adv = true;
-	}
-#else
-	}
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -1170,9 +1149,6 @@ static void process_scan_events(void)
  * -------------------------------------------------------------------------*/
 #define ADV_BURST_MS 1000U	/* Non-connectable adv burst wall time (state_timer) */
 #define SCAN_BURST_MS 1000U /* Passive scan burst wall time (state_timer) */
-#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
-#define GATEWAY_ADV_MS 30000U
-#endif
 
 static uint32_t last_adv_ts;
 static uint32_t last_scan_ts;
@@ -1273,14 +1249,6 @@ static void state_work_handler(struct k_work *work)
 		ble_state = BLE_STATE_IDLE;
 	}
 
-#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
-	if (ble_state == BLE_STATE_CONNECTABLE_ADV)
-	{
-		(void)bt_le_adv_stop();
-		ble_state = BLE_STATE_IDLE;
-	}
-#endif
-
 	if (ble_state == BLE_STATE_SCANNING)
 	{
 		LOG_INF("state: scan burst ending — stopping scanner");
@@ -1296,19 +1264,6 @@ static void state_work_handler(struct k_work *work)
 	{
 		return;
 	}
-
-#if JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV
-	if (do_gateway_adv)
-	{
-		do_gateway_adv = false;
-		if (start_connectable_adv() == 0)
-		{
-			ble_state = BLE_STATE_CONNECTABLE_ADV;
-			k_timer_start(&state_timer, K_MSEC(GATEWAY_ADV_MS), K_NO_WAIT);
-			return;
-		}
-	}
-#endif
 
 	bool scan_due = scan_interval_enabled() &&
 					interval_elapsed(now, last_scan_ts, get_effective_scan_interval_s());

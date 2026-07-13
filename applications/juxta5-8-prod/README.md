@@ -20,7 +20,7 @@ End-to-end user flow as orchestrated by the **Voleo iOS app**. Magnet timing is 
 
 The user will build/flash and report any issues. `west` commands are only built into the nRF Extension (VS Code/Cursor).
 
-RTT console is the primary runtime log (`CONFIG_USE_SEGGER_RTT=y`). Optional: enable JXGA opportunistic gateway advertising at compile time with `-DJUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=1` (see [Pending](#pending--not-yet-implemented)).
+RTT console is the primary runtime log (`CONFIG_USE_SEGGER_RTT=y`).
 
 ## Defaults (NVS, first boot)
 
@@ -117,16 +117,13 @@ IDLE
  └─ iOS connects           → CONNECTED (radio owned by BT stack)
                                      └─ disconnect → IDLE
 
-(JXGA_ overheard in scan → 30 s connectable “gateway” adv: **disabled** in default build;
-re-enable with `-DJUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=1` or define the macro to 1 in `main.c`.)
-
 Parallel vitals timer (every vitals_interval_s):
   LIS2DH12 temp + SAADC batt_mv + motion count → append JXV row
 ```
 
 ### Scanning vs advertising (operational BLE)
 
-After **production init** (`hardware_ready`), the device never runs **non-connectable advertising** and **passive scanning** at the same time. `**adv_interval_s`** and `**scan_interval_s`** are **any whole-second integer from 0 to 120** (no stepping): **0** turns off that modality; values **> 120** are clamped to **120** when saved. **Opportunistic connectable advertising** after overhearing a `**JXGA_`** name is **disabled** by default (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` = 0 unless overridden at compile time; default in `[src/main.c](src/main.c)`). A `**k_timer`** (`state_timer`) wakes a `**k_work`** handler (`state_work_handler`) on a schedule; each invocation **tears down** whatever phase was active (stop adv and/or stop scan), returns to an internal **IDLE** bookkeeping state, then optionally starts **one** new phase.
+After **production init** (`hardware_ready`), the device never runs **non-connectable advertising** and **passive scanning** at the same time. `**adv_interval_s`** and `**scan_interval_s`** are **any whole-second integer from 0 to 120** (no stepping): **0** turns off that modality; values **> 120** are clamped to **120** when saved. A `**k_timer`** (`state_timer`) wakes a `**k_work`** handler (`state_work_handler`) on a schedule; each invocation **tears down** whatever phase was active (stop adv and/or stop scan), returns to an internal **IDLE** bookkeeping state, then optionally starts **one** new phase.
 
 **Phases (mutually exclusive on the radio during normal operation)**
 
@@ -135,7 +132,6 @@ After **production init** (`hardware_ready`), the device never runs **non-connec
 | ------------------------------------------------ | ----------------------------------------------------------------------------- | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Non-connectable advertising**                  | `start_nonconn_adv()` — fast interval, name in AD only                        | `ADV_BURST_MS` (**1000 ms**)  | Broadcast `JX_…` identity so other Juxta units can see us                                                                                                                     |
 | **Passive scanning**                             | `start_scanning()` — stops any adv first, 100 ms gap, then `bt_le_scan_start` | `SCAN_BURST_MS` (**1000 ms**) | Listen for peer `JX_…` names; queue events for **JXB** logging after the burst                                                                                                |
-| **Connectable “gateway” advertising** (optional) | `start_connectable_adv()` (Hublink, full GATT)                                | `GATEWAY_ADV_MS` (**30 s**)   | When `JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` is **1**: after a `**JXGA_`** name is overheard in scan, open a connectable window for an iOS gateway. **Default build: disabled.** |
 
 
 **Non-connectable advertising burst details** (see `start_nonconn_adv()` and `ADV_BURST_MS` in `[src/main.c](src/main.c)`):
@@ -150,7 +146,7 @@ After **production init** (`hardware_ready`), the device never runs **non-connec
 | AD payload                                       | `BT_DATA_NAME_COMPLETE`               | Local name `JX_…` (`adv_name`); non-connectable, identity-only burst for peer discovery.                                                                                                              |
 
 
-**When both “due”, scan wins.** After going IDLE, the handler evaluates `**scan_due`** only if `**scan_interval_s` ≠ 0** (`juxta_time_now()` ≥ `last_scan_ts` + effective `**scan_interval_s`**), then `**adv_due`** only if `**adv_interval_s` ≠ 0** (≥ `last_adv_ts` + `**adv_interval_s`**). If both intervals are 0, periodic scan and non-connectable advertising are skipped and the state timer is not armed for them (connectable use cases unchanged). If `JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` is enabled, `**do_gateway_adv`** (set when a scanned name begins with `**JXGA_**`) is evaluated **before** `scan_due` / `adv_due`. If nothing applies, it programs the timer for the **earlier** of the next enabled scan vs adv deadline, plus a small **random jitter** (0–999 ms) to desynchronize colliding devices.
+**When both “due”, scan wins.** After going IDLE, the handler evaluates `**scan_due`** only if `**scan_interval_s` ≠ 0** (`juxta_time_now()` ≥ `last_scan_ts` + effective `**scan_interval_s`**), then `**adv_due`** only if `**adv_interval_s` ≠ 0** (≥ `last_adv_ts` + `**adv_interval_s`**). If both intervals are 0, periodic scan and non-connectable advertising are skipped and the state timer is not armed for them. If nothing applies, it programs the timer for the **earlier** of the next enabled scan vs adv deadline, plus a small **random jitter** (0–999 ms) to desynchronize colliding devices.
 
 **Timing note:** `scan_due` / `adv_due` use `**juxta_time_now()` in whole seconds**, `; `**ADV_BURST_MS`** and `**SCAN_BURST_MS`** are both **1 s** wall-time bursts scheduled sequentially, not divisors of the interval. **Idle-period jitter** (0–999 ms on the next sleep) spreads peer wakeups when many devices use similar intervals; it does not randomize burst lengths.
 
@@ -209,7 +205,6 @@ stateDiagram-v2
 
     IDLE --> SCANNING : scan interval elapsed
     IDLE --> ADVERTISING : adv interval elapsed
-    %% JXGA_ connectable gateway adv (CONNECTABLE_ADV) disabled when JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=0
 
     SCANNING --> IDLE : 1 s burst done\nflush JXB rows
     ADVERTISING --> IDLE : 1 s burst done
@@ -590,7 +585,7 @@ applications/juxta5-8-prod/
 | NOR CSV logging             | JXS events, JXV vitals, JXB BLE observations; append-only, `#EOF` on close                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Daily file rotation         | `ensure_file()` in `[src/juxta_log.c](src/juxta_log.c)`: when the calendar date from `unix_time` no longer matches the active pseudo-file, the previous file is closed with `#EOF` and a new `*yyyymmdd.csv` is created. On each new **calendar day**, the first JXS/JXV/JXB append runs `touch_all_for_calendar_day()` so **all three** types get a dated file for that day. **JXS** new-file creation auto-emits a `day_start` row (NVS snapshot via the existing JXS columns) so the day is self-describing; **JXV/JXB** stay strict CSV (header + data rows only). Requires a valid clock; old files remain until Gateway `clearMemory`. **File-creation guarantee**: any JXS event with a valid clock (the first row written after a sync-gate is the auto-emitted `day_start`, immediately followed by `shelf_exit`) calls `touch_all_for_calendar_day` and creates JXS/JXV/JXB for today; rows logged with `unix_time == 0` are silently dropped. The `boot` row therefore always lands in an existing JXS file |
 | Log-state cache             | MCU NVS caches file offsets; scans NOR on cache miss                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| BLE state machine           | Non-connectable advertising when `adv_interval_s` is **1–120** s, any integer (**0** = off); passive scan bursts when `scan_interval_s` is **1–120** s, any integer (**0** = off; effective scan interval `**scan_interval_s` × `inactivity_multiplier**` when multiplier **> 1** and last vitals window had no motion, capped at **120** s); JXGA_ opportunistic connectable adv **disabled** in source (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV`)                                                                                                      |
+| BLE state machine           | Non-connectable advertising when `adv_interval_s` is **1–120** s, any integer (**0** = off); passive scan bursts when `scan_interval_s` is **1–120** s, any integer (**0** = off; effective scan interval `**scan_interval_s` × `inactivity_multiplier**` when multiplier **> 1** and last vitals window had no motion, capped at **120** s)                                                                                                      |
 | Battery level in Node JSON  | SAADC mV sampled on connect and each vitals tick; calibrated factor 7.96×; linear 3.0–4.2 V → 0–100 %                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | Battery safeguards          | Brownout < **2.75** V → shelf mode (boot + vitals timer, logs `low_battery`); DFU gate < 3.2 V → falls back to normal wake                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Hublink GATT service        | Node, Gateway, Filename, File Transfer characteristics; UUIDs match iOS companion                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -606,13 +601,4 @@ applications/juxta5-8-prod/
 | File listing wire format    | `name\|size;name\|size;…` indication; listing **size** is CSV payload only (no filename line, no `#EOF`); transfer ends with 3-byte `EOF` indication on File Transfer                                                                                                                                                                                                                                                                                                                                                                                |
 | Day-start provenance        | Every new JXS pseudo-file leads with a `day_start` row (current NVS settings via the standard JXS columns: subject, experiment, intervals, ble_name). JXV/JXB stay strict CSV (header + data rows). Replaces the previous `#device_settings` JXV comment lines that broke single-header CSV parsing                                                                                                                                                                                                                                                       |
 | FUEL pin correction         | FUEL on P0.30/AIN6 (was incorrectly mapped to P0.28/AIN4 = AXY_INT2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-
-
-### Pending / Not Yet Implemented
-
-
-| Feature                             | Notes                                                                                                                                                                                                                                                                      |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **JXGA_ opportunistic gateway adv** | Post–ProductionInit connectable advertising after overhearing `JXGA`_* in scan is **compiled out** (`JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV` = 0). Re-enable with `-DJUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV=1` or by defining the macro to **1** before the `#ifndef` in `main.c`. |
-
 

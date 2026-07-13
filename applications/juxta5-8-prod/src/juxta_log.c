@@ -63,15 +63,11 @@ void juxta_log_set_long_op_tick(void (*tick)(void))
 /* Single recursive-style mutex guarding every public juxta_log_* entry
  * point.  Zephyr's k_mutex is already recursive (counts re-locks by the
  * owning thread), so juxta_log_init -> juxta_log_format -> erase_region
- * paths self-nest safely.  Today this is latent-race insurance: production
- * is non-connectable so BT RX never touches the log concurrently with the
- * system workqueue.  But the moment any path is added where two threads
- * can both reach a juxta_log_* call (e.g. re-enabling
- * JUXTA_PROD_ENABLE_JXGA_GATEWAY_ADV), the shared static buffers
- * (chunk[], row[], header[], find_eof_or_erased buf[]) and the
- * ctx->files[]/file_count mutations become torn-read/torn-write hazards
- * that produce out-of-bounds indexing with no warning.  The mutex closes
- * that door cheaply. */
+ * paths self-nest safely.  Production is non-connectable between sync sessions,
+ * so BT RX does not touch the log concurrently with the system workqueue;
+ * the mutex still guards against any future path where two threads could reach
+ * a juxta_log_* call and tear shared static buffers (chunk[], row[], header[],
+ * find_eof_or_erased buf[]) or ctx->files[]/file_count mutations. */
 K_MUTEX_DEFINE(s_log_mutex);
 
 #define LOG_LOCK() (void)k_mutex_lock(&s_log_mutex, K_FOREVER)
