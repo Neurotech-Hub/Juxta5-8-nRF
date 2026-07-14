@@ -54,6 +54,12 @@ int juxta_settings_clear_log_cache(void);
 enum juxta_op_mode juxta_settings_get_op_mode(void);
 int juxta_settings_set_op_mode(enum juxta_op_mode mode);
 
+/* Direct single-key op_mode read, safe before juxta_settings_init() (same
+ * pattern as the boot counter).  The Step 3 POR-resume decision needs the
+ * persisted mode long before the full Step 7 subtree load.  Returns SHELF
+ * on any error or unknown stored value. */
+enum juxta_op_mode juxta_settings_read_op_mode_early(void);
+
 /* Forensic breadcrumb: written at every shelf entry, consumed (emitted as a
  * JXS row, then cleared) at the next boot that reaches a valid clock.  Kept
  * in its own NVS key so it survives independently of the settings blob. */

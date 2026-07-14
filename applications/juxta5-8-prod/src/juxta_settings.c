@@ -421,6 +421,39 @@ static int boot_count_direct_cb(const char *key, size_t len, settings_read_cb re
 	return 0;
 }
 
+static int op_mode_direct_cb(const char *key, size_t len, settings_read_cb read_cb,
+							 void *cb_arg, void *param)
+{
+	uint8_t *out = param;
+
+	ARG_UNUSED(key);
+	if (len == sizeof(*out))
+	{
+		(void)read_cb(cb_arg, out, sizeof(*out));
+	}
+	return 0;
+}
+
+enum juxta_op_mode juxta_settings_read_op_mode_early(void)
+{
+	if (ensure_settings_subsys() != 0)
+	{
+		return JUXTA_OP_MODE_SHELF;
+	}
+
+	uint8_t stored = (uint8_t)JUXTA_OP_MODE_SHELF;
+
+	(void)settings_load_subtree_direct(SETTINGS_SUBTREE "/" SETTINGS_KEY_OP_MODE,
+									   op_mode_direct_cb, &stored);
+
+	if (stored != (uint8_t)JUXTA_OP_MODE_PROD && stored != (uint8_t)JUXTA_OP_MODE_DFU &&
+		stored != (uint8_t)JUXTA_OP_MODE_SHELF)
+	{
+		return JUXTA_OP_MODE_SHELF;
+	}
+	return (enum juxta_op_mode)stored;
+}
+
 int juxta_settings_boot_count_increment(void)
 {
 	int rc = ensure_settings_subsys();

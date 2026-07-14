@@ -11,6 +11,9 @@
  *                      → 5 s debounce, then a confirmed 3 s magnet hold returns to shelf
  *   Silent reset (DOG/LOCKUP/SREQ) + op_mode == PROD → production recovery
  *     (RTC restored from retained RAM, JXS wdt_recovery_* row).
+ *   True POR (RESETREAS == 0) + op_mode == PROD + valid NOR checkpoint →
+ *     POR production resume (RTC restored from the 1 Hz checkpoint ring,
+ *     JXS por_recovery row, draft vitals flushed as a JXV row).
  *   Other reset (cold without OFF wake) → shelf mode.
  *
  * Connected state: LED solid ON.
@@ -47,6 +50,7 @@
 #include <zephyr/sys/util.h>
 
 #include "ble_service.h"
+#include "juxta_checkpoint.h"
 #include "juxta_log.h"
 #include "juxta_pof.h"
 #include "juxta_prod.h"
@@ -287,6 +291,11 @@ static void wdt_feed_work_handler(struct k_work *work)
 	(void)k_work_reschedule(&wdt_feed_work, K_MSEC(WDT_FEED_PERIOD_MS));
 }
 
+/* NOR checkpoint append — must run on the workqueue (SPI + mutex), so the
+ * 1 s timer callback below only submits it.  Handler defined after the
+ * motion/vitals state it snapshots. */
+static struct k_work checkpoint_work;
+
 static void rtc_checkpoint_cb(struct k_timer *timer)
 {
 	ARG_UNUSED(timer);
@@ -294,6 +303,10 @@ static void rtc_checkpoint_cb(struct k_timer *timer)
 	 * timer context — juxta_time_now() is lock-free (atomic) and
 	 * juxta_time_retained_update() touches only the .noinit struct. */
 	juxta_time_retained_update();
+
+	/* POR-survivable twin of the retained-RAM snapshot: one 32 B record
+	 * to the external-NOR checkpoint ring per tick (juxta_checkpoint.c). */
+	k_work_submit(&checkpoint_work);
 }
 
 /* Also call from long paths (NOR append burst, BLE state machine) so a blocked
@@ -417,6 +430,11 @@ static void enter_shelf_mode(enum juxta_shelf_reason reason)
 
 	bool debug = (CoreDebug->DHCSR & CoreDebug_DHCSR_C_DEBUGEN_Msk) != 0U;
 
+	/* Stop the 1 Hz NOR checkpoint before anything else: a record written
+	 * after this point must never be able to resurrect a session the
+	 * operator is deliberately ending. */
+	juxta_checkpoint_disable();
+
 	/* Forensic breadcrumb: persist why this life ended in NVS so the next
 	 * valid-clock boot can append a `crumb_<reason>` JXS row.  This is the
 	 * fix for the "silent shelf entries destroy all forensics" gap — a
@@ -445,6 +463,12 @@ static void enter_shelf_mode(enum juxta_shelf_reason reason)
 	(void)juxta_settings_set_op_mode(JUXTA_OP_MODE_SHELF);
 	juxta_time_retained_invalidate();
 	juxta_pof_disarm();
+
+	/* Erase the checkpoint ring *after* op_mode := SHELF so a power loss
+	 * mid-erase still leaves the unit unrecoverable-by-design (op_mode
+	 * gates the POR-resume path).  Best effort; skips blank sectors so a
+	 * pre-production shelf entry costs nearly nothing. */
+	(void)juxta_checkpoint_erase();
 
 	k_sleep(K_MSEC(30)); /* flush RTT */
 
@@ -708,9 +732,20 @@ static bool shelf_exit_logged_this_boot;
  * (crash analysis §5.8).  This flag makes the write one-shot. */
 static bool boot_logged_this_boot;
 /* wdt_recovery_{dog,sreq,lockup,no_rtc} when this boot is a silent-reset
- * recovery; NULL otherwise.  File-scope so the datetime-sync flush can emit
- * it before the sync-session offload begins. */
+ * recovery, or por_recovery when a true POR interrupted production; NULL
+ * otherwise.  File-scope so the datetime-sync flush can emit it before the
+ * sync-session offload begins. */
 static const char *g_recovery_event;
+
+/* POR production resume (fw 5.8.4): set at Step 3 when RESETREAS == 0 but
+ * NVS op_mode == PROD and the NOR checkpoint ring holds a valid draft —
+ * i.e. power was lost mid-session.  The Step 7 recovery block consumes the
+ * flag (restores the clock, sets g_recovery_event); the draft itself is
+ * flushed as a JXV row at Step 9 so the interrupted session loses at most
+ * one checkpoint interval of vitals instead of up to a full vitals tick. */
+static bool g_por_resume;
+static struct juxta_checkpoint_record g_recovery_draft;
+static bool g_recovery_draft_valid;
 
 /* One-shot append of the current boot's identity rows: `boot`, then the
  * wdt_recovery_* row when this boot is a recovery.  No-ops silently while
@@ -816,6 +851,35 @@ static struct k_work vitals_work;
 static struct k_timer vitals_timer;
 static bool app_timers_ready;
 
+/* Last LIS2DH12 temperature read by the vitals tick — reused by the 1 Hz
+ * checkpoint so the checkpoint path never adds its own SPI sensor read. */
+static int8_t g_last_temp_c;
+
+/* 1 Hz "draft vitals" snapshot into the NOR checkpoint ring (submitted from
+ * rtc_checkpoint_cb).  motion_events is intentionally *not* cleared: the
+ * checkpoint carries "motion since the last JXV row", which becomes the
+ * recovery JXV row's motion column if this life ends in a POR. */
+static void checkpoint_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	uint32_t now = juxta_time_now();
+
+	if (!hardware_ready || now == 0U)
+	{
+		return;
+	}
+
+	struct juxta_checkpoint_record rec = {
+		.unix_time = now,
+		.motion_count = motion_events, /* aligned 32-bit read: atomic on ARM */
+		.batt_mv = g_batt_mv,
+		.temp_c = g_last_temp_c,
+	};
+
+	(void)juxta_checkpoint_write(&rec);
+}
+
 static void vitals_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -856,6 +920,7 @@ static void vitals_work_handler(struct k_work *work)
 	LOG_INF("vitals: reading temp");
 	(void)lis2dh12_zephyr_read_temp_c(&lis2dh12, &temp_c);
 	LOG_INF("vitals: temp done temp_c=%d", (int)temp_c);
+	g_last_temp_c = temp_c; /* cached for the 1 Hz checkpoint snapshot */
 
 	/* Skip NOR write while the radio is actively scanning: the SPI bus is
 	 * shared and a concurrent scan burst adds latency.  The next vitals
@@ -1608,6 +1673,11 @@ static void clear_memory_work_handler(struct k_work *work)
 	{
 		LOG_INF("clearMemory: erase complete");
 	}
+
+	/* The checkpoint ring lives outside the CSV regions, so format does
+	 * not touch it — clear it here for the same clean-slate semantics
+	 * (checkpointing restarts at slot 0 and stays enabled). */
+	(void)juxta_checkpoint_reset();
 }
 
 void juxta_ble_clear_memory_requested(void)
@@ -1656,6 +1726,7 @@ int main(void)
 	k_work_init(&led_work, led_work_handler);
 	k_work_init_delayable(&shelf_work, shelf_work_handler);
 	k_work_init(&clear_memory_work, clear_memory_work_handler);
+	k_work_init(&checkpoint_work, checkpoint_work_handler);
 	k_timer_init(&led_timer, led_timer_cb, NULL);
 
 	/* ----------------------------------------------------------------
@@ -1824,8 +1895,29 @@ int main(void)
 		 * ------------------------------------------------------ */
 		if (fresh_boot)
 		{
-			LOG_INF("Fresh power-on → shelf mode");
-			enter_shelf_mode(JUXTA_SHELF_REASON_FRESH_BOOT); /* does not return */
+			/* POR production resume (fw 5.8.4): a true POR used to be
+			 * indistinguishable from a battery insertion and always
+			 * shelved — killing the session when a supply/ESD event
+			 * reset a deployed unit mid-recording.  If the persisted
+			 * op_mode says production was running AND the NOR checkpoint
+			 * ring holds a valid draft, this is a mid-session power loss:
+			 * resume instead of shelving.  Fresh units, shelved units and
+			 * DFU units (op_mode != PROD) still route to shelf. */
+			enum juxta_op_mode early_mode = juxta_settings_read_op_mode_early();
+
+			if (early_mode == JUXTA_OP_MODE_PROD &&
+				juxta_checkpoint_load(&g_recovery_draft) == 0)
+			{
+				g_por_resume = true;
+				g_recovery_draft_valid = true;
+				LOG_WRN("POR during production (draft unix=%u) — resuming session",
+						g_recovery_draft.unix_time);
+			}
+			else
+			{
+				LOG_INF("Fresh power-on → shelf mode");
+				enter_shelf_mode(JUXTA_SHELF_REASON_FRESH_BOOT); /* does not return */
+			}
 		}
 
 		if (from_system_off)
@@ -1950,6 +2042,20 @@ int main(void)
 				LOG_INF("Recovery: RTC restored from retained RAM (unix=%u, event=%s)",
 						(unsigned)recovery_unix, g_recovery_event);
 			}
+			else if (juxta_checkpoint_load(&g_recovery_draft) == 0)
+			{
+				/* Retained RAM lost but the NOR checkpoint ring survives
+				 * everything short of a full erase — restore the clock
+				 * from the draft instead of parking in the sync gate. */
+				g_recovery_draft_valid = true;
+				recovery_unix = g_recovery_draft.unix_time +
+								(uint32_t)(k_uptime_get() / 1000);
+				recovery_full = true;
+				g_recovery_event = "wdt_recovery_no_rtc";
+				juxta_time_set(recovery_unix);
+				LOG_WRN("Recovery: retained RAM invalid — RTC restored from NOR draft (unix=%u)",
+						(unsigned)recovery_unix);
+			}
 			else
 			{
 				g_recovery_event = "wdt_recovery_no_rtc";
@@ -1957,8 +2063,23 @@ int main(void)
 				LOG_WRN("Recovery: retained RAM invalid — forcing datetime_sync");
 			}
 		}
-		LOG_INF("Recovery: op_mode=%u silent=%d attempted=%d full=%d",
-				(unsigned)saved_mode, (int)is_silent_reset,
+		else if (g_por_resume && saved_mode == JUXTA_OP_MODE_PROD && !debugger_active)
+		{
+			/* POR production resume: draft already loaded at Step 3.
+			 * Worst-case clock error ≈ one checkpoint interval + the time
+			 * power was actually out; boot elapsed time is compensated. */
+			recovery_attempted = true;
+			shelf_exit_logged_this_boot = true; /* no magnet involved */
+			recovery_unix = g_recovery_draft.unix_time +
+							(uint32_t)(k_uptime_get() / 1000);
+			recovery_full = true;
+			g_recovery_event = "por_recovery";
+			juxta_time_set(recovery_unix);
+			LOG_INF("POR recovery: RTC restored from NOR draft (unix=%u)",
+					(unsigned)recovery_unix);
+		}
+		LOG_INF("Recovery: op_mode=%u silent=%d por=%d attempted=%d full=%d",
+				(unsigned)saved_mode, (int)is_silent_reset, (int)g_por_resume,
 				(int)recovery_attempted, (int)recovery_full);
 	}
 
@@ -2006,6 +2127,16 @@ int main(void)
 	hardware_ready = true;
 	juxta_ble_set_production_ready();
 
+	/* Checkpoint ring hygiene before op_mode := PROD.  Fresh activation:
+	 * erase the ring so a stale draft from a previous session can never
+	 * be mistaken for this one (the guarantee behind the POR-resume gate).
+	 * Recovery boot: keep the ring — its history spans the interrupted
+	 * session and seq continuity survives a POR storm. */
+	if (!recovery_attempted)
+	{
+		(void)juxta_checkpoint_reset();
+	}
+
 	/* Persist op_mode := PROD only after hardware is ready and BLE is
 	 * fully wired up.  A failure before this point cleanly leaves the unit
 	 * in its previous mode (SHELF or DFU), which is the desired
@@ -2026,6 +2157,20 @@ int main(void)
 	 * forensic rows carried over from the previous life. */
 	log_boot_identity();
 	emit_boot_forensics();
+
+	/* Recovery boots: flush the interrupted session's draft as a real JXV
+	 * row (timestamped at capture, i.e. ≤1 checkpoint interval before the
+	 * death) so the truncated session keeps its final vitals + motion
+	 * count.  The in-RAM motion counter restarts at 0, which is correct:
+	 * the draft row just consumed the pre-reset count. */
+	if (g_recovery_draft_valid)
+	{
+		uint16_t draft_motion = (uint16_t)MIN(g_recovery_draft.motion_count, 65535U);
+
+		(void)juxta_log_append_vitals(&log_ctx, g_recovery_draft.unix_time, draft_motion,
+									  g_recovery_draft.batt_mv, g_recovery_draft.temp_c);
+		g_recovery_draft_valid = false;
+	}
 
 	k_work_init(&state_work, state_work_handler);
 	k_work_init(&vitals_work, vitals_work_handler);

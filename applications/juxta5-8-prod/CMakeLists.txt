@@ -12,6 +12,7 @@ target_include_directories(app PRIVATE
 target_sources(app PRIVATE
     src/main.c
     src/ble_service.c
+    src/juxta_checkpoint.c
     src/juxta_log.c
     src/juxta_pof.c
     src/juxta_settings.c

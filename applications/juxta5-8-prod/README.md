@@ -35,7 +35,7 @@ RTT console is the primary runtime log (`CONFIG_USE_SEGGER_RTT=y`).
 | `experiment` | empty | Gateway `experiment` |
 | `upload_path` | `/` | Fixed placeholder in NVS blob |
 
-Firmware version **`5.8.3`**; NOR schema **`jxta-nor-csv-v5`** (`JUXTA_LOGGING_VERSION` 5).
+Firmware version **`5.8.4`**; NOR schema **`jxta-nor-csv-v5`** (`JUXTA_LOGGING_VERSION` 5).
 
 ---
 
@@ -46,8 +46,13 @@ Firmware version **`5.8.3`**; NOR schema **`jxta-nor-csv-v5`** (`JUXTA_LOGGING_V
 ```
 Power-on / Reset
       │
-      ├─ RESETREAS == 0 (fresh power-on / battery insertion)
-      │         └─→ Shelf mode (System OFF, MAG_INT wake). No LED.
+      ├─ RESETREAS == 0 (true POR: power loss, ESD, battery insertion)
+      │         ├─ NVS op_mode == PROD AND valid NOR checkpoint draft
+      │         │         └─→ POR production resume: restore RTC from draft,
+      │         │             JXS por_recovery row, draft flushed as JXV row.
+      │         │             Magnet not required; straight back to production.
+      │         └─ otherwise (fresh unit, shelved unit, DFU, no draft)
+      │                   └─→ Shelf mode (System OFF, MAG_INT wake). No LED.
       │
       ├─ RESETREAS[OFF] set (woke from System OFF via magnet)
       │         └─→ LED ON while magnet held → measure hold duration
@@ -58,7 +63,9 @@ Power-on / Reset
       ├─ RESETREAS[DOG|LOCKUP|SREQ] (silent reset) AND NVS op_mode == PROD
       │         └─→ Production recovery boot:
       │                   ├─ retained RAM valid → restore RTC, JXS wdt_recovery_{dog,sreq,lockup}
-      │                   └─ retained RAM lost  → datetime sync, JXS wdt_recovery_no_rtc
+      │                   ├─ retained RAM lost, valid NOR draft → restore RTC from draft,
+      │                   │                                       JXS wdt_recovery_no_rtc
+      │                   └─ retained RAM lost, no draft → datetime sync, JXS wdt_recovery_no_rtc
       │             Magnet not required; goes straight back to production loop.
       │
       └─ Other silent reset (DFU / SHELF saved mode) → existing post-reset behaviour.
@@ -88,10 +95,45 @@ Driven by two persistent stores:
   every clean `enter_shelf_mode()` so a planned shelf entry never looks like
   a recoverable production boot.
 
-Cold boot still wins: `RESETREAS == 0` (battery insertion) routes to shelf
-even when NVS `op_mode == PROD`, preserving the existing battery-insert
-behaviour. Every recovery is auditable via a `wdt_recovery_{dog,sreq,lockup,no_rtc}`
+Every recovery is auditable via a `wdt_recovery_{dog,sreq,lockup,no_rtc}`
 row appended to JXS immediately after the `boot` row.
+
+### POR production resume (fw 5.8.4)
+
+Retained RAM does not survive a **true POR** (`RESETREAS == 0`) — until 5.8.4
+a mid-session power loss (supply collapse, ESD, battery bounce) always routed
+to shelf and silently ended the recording (see
+[`CRASH_ANALYSIS_2026-07-09.md`](CRASH_ANALYSIS_2026-07-09.md) and the
+Test18/Test19 truncated-vitals failures). Production now also checkpoints to
+a store that survives power loss:
+
+- **NOR checkpoint ring** ([`src/juxta_checkpoint.c`](src/juxta_checkpoint.c)):
+  the last 64 KB of the external NOR (`0x3F0000–0x3FFFFF`, carved from the
+  tail of JXB). The same 1 s timer that refreshes retained RAM also appends a
+  32 B CRC-guarded record (unix time, motion count since the last JXV row,
+  battery mV, temperature) — "draft vitals". 16 × 4 KB sectors, 128 records
+  per sector: the head erases each sector as it enters it (~45 ms once per
+  ~2 min), keeping ~34 min of history. Endurance ≈ 42 sector erases/day →
+  years at typical 100k NOR P/E cycles. A record torn by the dying supply
+  fails CRC and the previous second's record wins.
+- **Resume decision** (Step 3, before any magnet logic): `RESETREAS == 0`
+  AND NVS `op_mode == PROD` AND a valid draft in the ring → restore the RTC
+  from the draft (boot time compensated; worst-case error ≈ 1 s + time power
+  was actually out), skip the magnet and sync gates, and re-enter production
+  directly. JXS gets `boot` + **`por_recovery`** rows, and the draft is
+  flushed as a real JXV row timestamped at capture — the interrupted session
+  loses at most ~1 s of vitals and its final motion count instead of up to a
+  full vitals tick. A repeating electrical fault now writes one
+  `por_recovery` row per hit, making persistence visible at offload.
+- **Session isolation**: the ring is erased at every fresh production
+  activation (before `op_mode := PROD`), on `clearMemory`, and at every
+  `enter_shelf_mode()` (after `op_mode := SHELF`, so a power cut mid-erase
+  still leaves the unit unrecoverable-by-design). A stale draft from an
+  earlier session can therefore never resurrect a deliberately-ended one.
+
+True battery insertion on a fresh or shelved unit still routes to shelf:
+`op_mode != PROD` in both cases. The battery gate (3 consecutive samples
+< 2750 mV) also still wins, so a genuinely dead battery cannot boot-loop.
 
 ### Datetime sync phase (normal wake only)
 
@@ -307,7 +349,7 @@ Single JSON object. iOS reads this once on connect. Keys are **camelCase**. `fir
 
 ```json
 {
-  "firmwareVersion": "5.8.3",
+  "firmwareVersion": "5.8.4",
   "batteryLevel": 87,
   "memoryLevel": 12,
   "deviceId": "JX_9B10A1",
@@ -418,8 +460,9 @@ Gateway-controlled diagnostic flag to isolate field issues from LIS2DH12 motion 
 
 ### clearMemory semantics
 
-`clearMemory` erases all NOR CSV regions (JXS, JXV, JXB) immediately. The erase
-runs on the system workqueue and may take several seconds.
+`clearMemory` erases all NOR CSV regions (JXS, JXV, JXB) immediately, then
+clears the POR-resume checkpoint ring (checkpointing restarts at slot 0).
+The erase runs on the system workqueue and may take several seconds.
 
 **No JXS row at erase time.** Provenance logging is deferred until the next NOR
 append (`juxta_log_format()` in [`src/juxta_log.c`](src/juxta_log.c) resets
@@ -476,11 +519,12 @@ Each entry is `filename|size_in_bytes`. **Size** is the **CSV payload** byte cou
 
 Logging schema **`jxta-nor-csv-v5`** ([`src/juxta_prod.h`](src/juxta_prod.h)). JXS event rows include **`adv_interval_s`** (after `scan_interval_s`). Each new JXS pseudo-file leads with a `day_start` row that snapshots current NVS (subject, experiment, intervals) so the day is interpretable from JXS alone, without cross-referencing prior days. JXV and JXB stay strict CSV: a single column header followed by data rows only.
 
-| Region | Address               | Size  | Content               |
-| ------ | --------------------- | ----- | --------------------- |
-| JXS    | `0x000000 – 0x00FFFF` | 64 KB | Settings / events log |
-| JXV    | `0x010000 – 0x10FFFF` | 1 MB  | Vitals log            |
-| JXB    | `0x110000 – 0x3FFFFF` | 3 MB  | BLE observations log  |
+| Region     | Address               | Size    | Content                                  |
+| ---------- | --------------------- | ------- | ---------------------------------------- |
+| JXS        | `0x000000 – 0x00FFFF` | 64 KB   | Settings / events log                    |
+| JXV        | `0x010000 – 0x10FFFF` | 1 MB    | Vitals log                               |
+| JXB        | `0x110000 – 0x3EFFFF` | 2.94 MB | BLE observations log                     |
+| Checkpoint | `0x3F0000 – 0x3FFFFF` | 64 KB   | POR-resume draft ring (not a CSV region) |
 
 
 All regions are append-only CSV. Each pseudo-file is physically stored as:
@@ -488,8 +532,8 @@ All regions are append-only CSV. Each pseudo-file is physically stored as:
 ```
 JXSYYYYMMDD.csv
 unix,event,device_id,subject_id,experiment,fw_version,scan_interval_s,adv_interval_s,vitals_interval_s,ble_name
-1715200000,day_start,JX_9B10A1,JX_9B10A1,,5.8.3,30,5,60,JX_9B10A1
-1715200000,boot,JX_9B10A1,JX_9B10A1,,5.8.3,30,5,60,JX_9B10A1
+1715200000,day_start,JX_9B10A1,JX_9B10A1,,5.8.4,30,5,60,JX_9B10A1
+1715200000,boot,JX_9B10A1,JX_9B10A1,,5.8.4,30,5,60,JX_9B10A1
 ```
 
 ```
@@ -525,6 +569,7 @@ Hardware + iOS session (also summarized in the repo [`README.md`](../../README.m
 7. Second `JX_XXXXXX` nearby during scan → JXB rows in RTT / NOR.
 8. Gateway `{"clearMemory":true}` during the sync-gate session (after finalizing settings, before disconnect) → all NOR CSV regions erased; **no JXS row at erase time**. Disconnect into production; JXS opens with `day_start` → `user_disconnected` → `boot`. NVS settings unchanged (reconnect and read Node).
 9. Power cycle → NVS settings and log cache reconcile without full NOR rescan.
+10. **POR resume**: while production is running (no debugger), cut and restore battery power → device resumes production without a magnet; JXS shows `boot` + `por_recovery`, JXV shows a draft row timestamped ≤1 s before the cut, and the restored clock tracks real time to within a few seconds. A magnet shelf followed by a power cycle must **still** stay in shelf (`op_mode == SHELF` gates the resume).
 
 ---
 
@@ -613,6 +658,11 @@ return), `dfu_exit`, `brownout` (vitals-tick low battery), `gateway_reset`.
 The boot counter is a monotonic NVS value incremented once per boot — gaps
 between consecutive `crumb_*` rows count the silent lives in between.
 
+Since fw 5.8.4, a mid-production POR resumes the session instead of shelving
+(see *POR production resume*), so it produces a `por_recovery` JXS row rather
+than a `crumb_fresh_boot`. `crumb_fresh_boot` now indicates a POR on a unit
+that was **not** in production (fresh/shelved/DFU unit, or no valid draft).
+
 Independently, the nRF52840 **power-fail comparator** (POFCON) is armed at
 every boot: VDDH threshold **3.6 V**, VDD threshold 1.7 V — just below the
 1.8 V REGOUT0 rail, because a threshold at/above the rail keeps POFWARN
@@ -630,8 +680,9 @@ pof_witness n=<event_count> up=<uptime_of_last_event_s> t=<unix_of_last_event>
 ```
 
 Interpretation for field failures: a reset **with** a `pof_witness` row =
-supply droop preceded the reset; a clean POR (`crumb_fresh_boot`) with **no**
-witness = ESD-class event or instantaneous supply collapse. The battery gate
+supply droop preceded the reset; a clean POR (`por_recovery`, or
+`crumb_fresh_boot` on non-production units) with **no** witness = ESD-class
+event or instantaneous supply collapse. The battery gate
 additionally requires **3 consecutive** low samples (5 ms apart) before
 shelving, so a transiently-recovering supply no longer converts into a
 multi-hour outage.
@@ -652,6 +703,7 @@ applications/juxta5-8-prod/
 └── src/
     ├── main.c           ← boot sequence, magnet hold, shelf mode, state machine
     ├── ble_service.c/h  ← Hublink GATT (Node/Gateway/Filename/FileTransfer)
+    ├── juxta_checkpoint.c/h ← POR-resume draft ring (last 64 KB of NOR, 1 Hz)
     ├── juxta_log.c/h    ← NOR CSV append, list, read, recover
     ├── juxta_pof.c/h    ← POFCON supply-droop witness (.noinit, POWER IRQ)
     ├── juxta_settings.c/h ← NVS-backed current settings + log-state cache + breadcrumb/boot counter
@@ -675,9 +727,10 @@ applications/juxta5-8-prod/
 | LED blink sequences         | Magnet hold: solid ON; DFU entry: 3× 200 ms blink; production init: 5× 50 ms blink                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | Datetime sync gate          | Connectable adv after normal wake; loops indefinitely until timestamp received; must have timestamp before production init                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Watchdog                    | 5 s window (`WDT_WINDOW_MS`), fed every 2 s (`WDT_FEED_PERIOD_MS`), pauses on debug halt; pre-warn callback (`wdt_warn_cb`) emits the last-running thread name + `thread_analyzer_print(0)` via `LOG_PANIC` so the cause of a silent hang lands in RTT before the reset |
-| Production recovery boot    | After a silent reset (`DOG`/`LOCKUP`/`SREQ`) with NVS `op_mode == PROD`, the firmware restores the RTC from a retained-RAM (`.noinit`) snapshot (magic + version + CRC32) and re-enters production without requiring a magnet or gateway re-sync. If the snapshot is invalid, falls through to datetime sync. Cold boot (`RESETREAS == 0`) still routes to shelf. A `wdt_recovery_{dog,sreq,lockup,no_rtc}` row is appended to JXS for audit |
+| Production recovery boot    | After a silent reset (`DOG`/`LOCKUP`/`SREQ`) with NVS `op_mode == PROD`, the firmware restores the RTC from a retained-RAM (`.noinit`) snapshot (magic + version + CRC32) and re-enters production without requiring a magnet or gateway re-sync. If the snapshot is invalid, falls back to the NOR checkpoint draft, then to datetime sync. A `wdt_recovery_{dog,sreq,lockup,no_rtc}` row is appended to JXS for audit |
+| POR production resume       | A true POR (`RESETREAS == 0`) with NVS `op_mode == PROD` and a valid draft in the NOR checkpoint ring resumes production directly: RTC restored from the draft (≈1 s accuracy + power-out time), no magnet or sync gate, JXS `boot` + `por_recovery` rows, draft flushed as a JXV row (final motion count + vitals of the interrupted session). Ring: last 64 KB of NOR, 32 B CRC records at 1 Hz, ~34 min history, erased at every activation / `clearMemory` / shelf entry. Fresh or shelved units (`op_mode != PROD`) still route to shelf |
 | Op-mode persistence         | NVS-backed one-byte key (separate from gateway settings blob) tracks last committed mode: `SHELF` (top of `enter_shelf_mode`), `DFU` (top of `enter_dfu_mode`), `PROD` (after `juxta_ble_set_production_ready()`). Gateway field updates do not rewrite this byte and vice-versa, minimising flash wear |
-| Retained-RAM RTC checkpoint | 1 s `k_timer` calls `juxta_time_retained_update()` from production; struct lives in `__noinit` section so it survives soft resets but is wiped by cold boot / System OFF. CRC32 + magic + version guard against partial writes |
+| Retained-RAM RTC checkpoint | 1 s `k_timer` calls `juxta_time_retained_update()` from production; struct lives in `__noinit` section so it survives soft resets but is wiped by cold boot / System OFF. CRC32 + magic + version guard against partial writes. The same tick also submits a 32 B draft record to the NOR checkpoint ring (`juxta_checkpoint.c`), the POR-survivable twin |
 | NVS settings                | `subject_id`, `experiment`, `scan_interval_s`, `vitals_interval_s`, `adv_interval_s`, `inactivity_multiplier` **1–10**, `motion_logging` **0/1** (plus `upload_path` slot always written as `**/**`; reserved bytes for legacy blob layout); separate keys: `op_mode`, `boot_count` (monotonic), `crumb` (shelf breadcrumb, consume-once)                                                                                                                                                                                                                                    |
 | NOR CSV logging             | JXS events, JXV vitals, JXB BLE observations; append-only, `#EOF` on close                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Daily file rotation         | `ensure_file()` in `[src/juxta_log.c](src/juxta_log.c)`: when the calendar date from `unix_time` no longer matches the active pseudo-file, the previous file is closed with `#EOF` and a new `*yyyymmdd.csv` is created. On each new **calendar day**, the first JXS/JXV/JXB append runs `touch_all_for_calendar_day()` so **all three** types get a dated file for that day. **JXS** new-file creation auto-emits a `day_start` row (NVS snapshot via the existing JXS columns) so the day is self-describing; **JXV/JXB** stay strict CSV (header + data rows only). Requires a valid clock; old files remain until Gateway `clearMemory`. **File-creation guarantee**: any JXS event with a valid clock (the first row written after a sync-gate is the auto-emitted `day_start`, immediately followed by `shelf_exit`) calls `touch_all_for_calendar_day` and creates JXS/JXV/JXB for today; rows logged with `unix_time == 0` are silently dropped. The `boot` row therefore always lands in an existing JXS file |
@@ -695,7 +748,7 @@ applications/juxta5-8-prod/
 | Debugger simulation loop    | `CoreDebug->DHCSR` detects J-Link; simulates shelf/wake/DFU cycle in-band; `sys_reboot()` restarts loop                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | Vitals logging              | LIS2DH12 temperature, SAADC battery voltage, motion count → JXV; motion snapshot drives inactivity **scan** multiplier when `motionLogging` is **true** (`false` → JXV `motion=0`, multiplier frozen)                                                                                                                                                                                                                                                                                                                                                                                                                |
 | BLE observation logging     | `JX_XXXXXX` peer detection → JXB rows with observer/peer/rssi                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| JXS provenance rows         | `day_start`, `shelf_exit`, `user_connected`, `time_set`, `user_disconnected`, `boot`, `shelf_entry`, `settings_changed`, `low_battery`, `wdt_recovery_dog`, `wdt_recovery_sreq`, `wdt_recovery_lockup`, `wdt_recovery_no_rtc`, `crumb_<reason>`, `pof_witness` — together these read as a chronological device lifecycle: every new JXS pseudo-file opens with a `day_start` row (current NVS snapshot); each magnet wake produces a `shelf_exit` (suppressed on recovery boots — no magnet involved); each real BLE session is bracketed by `user_connected` / `user_disconnected`; each operator-initiated shelf return writes `shelf_entry` before power-off; each silent-reset recovery emits one `wdt_recovery_*` row right after `boot`; `boot` + recovery rows are written the moment the clock becomes valid (during the sync gate) so a sync-session offload contains the current boot's identity; each boot with a pending shelf breadcrumb or POF witness emits `crumb_<reason>` / `pof_witness` rows (see [Forensic breadcrumbs](#forensic-breadcrumbs-shelf-entry-audit--supply-droop-witness)). `time_set` is written every time the gateway supplies a clock value (e.g. once per sync-gate session). `clearMemory` does **not** append a row — see [clearMemory semantics](#clearmemory-semantics) |
+| JXS provenance rows         | `day_start`, `shelf_exit`, `user_connected`, `time_set`, `user_disconnected`, `boot`, `shelf_entry`, `settings_changed`, `low_battery`, `wdt_recovery_dog`, `wdt_recovery_sreq`, `wdt_recovery_lockup`, `wdt_recovery_no_rtc`, `por_recovery`, `crumb_<reason>`, `pof_witness` — together these read as a chronological device lifecycle: every new JXS pseudo-file opens with a `day_start` row (current NVS snapshot); each magnet wake produces a `shelf_exit` (suppressed on recovery boots — no magnet involved); each real BLE session is bracketed by `user_connected` / `user_disconnected`; each operator-initiated shelf return writes `shelf_entry` before power-off; each silent-reset recovery emits one `wdt_recovery_*` row right after `boot`; each mid-production POR resume emits one `por_recovery` row right after `boot` (plus a draft JXV row); `boot` + recovery rows are written the moment the clock becomes valid (during the sync gate) so a sync-session offload contains the current boot's identity; each boot with a pending shelf breadcrumb or POF witness emits `crumb_<reason>` / `pof_witness` rows (see [Forensic breadcrumbs](#forensic-breadcrumbs-shelf-entry-audit--supply-droop-witness)). `time_set` is written every time the gateway supplies a clock value (e.g. once per sync-gate session). `clearMemory` does **not** append a row — see [clearMemory semantics](#clearmemory-semantics) |
 | File listing wire format    | `name\|size;name\|size;…` indication; listing **size** is CSV payload only (no filename line, no `#EOF`); transfer ends with 3-byte `EOF` indication on File Transfer                                                                                                                                                                                                                                                                                                                                                                                |
 | Day-start provenance        | Every new JXS pseudo-file leads with a `day_start` row (current NVS settings via the standard JXS columns: subject, experiment, intervals, ble_name). JXV/JXB stay strict CSV (header + data rows). Replaces the previous `#device_settings` JXV comment lines that broke single-header CSV parsing                                                                                                                                                                                                                                                       |
 | FUEL pin correction         | FUEL on P0.30/AIN6 (was incorrectly mapped to P0.28/AIN4 = AXY_INT2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |

@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define JUXTA_PRODUCT_NAME "Juxta5-8"
-#define JUXTA_FIRMWARE_VERSION "5.8.3"
+#define JUXTA_FIRMWARE_VERSION "5.8.4"
 #define JUXTA_LOG_SCHEMA "jxta-nor-csv-v5"
 #define JUXTA_LOGGING_VERSION 5
 

@@ -23,12 +23,15 @@ LOG_MODULE_REGISTER(juxta_log, LOG_LEVEL_INF);
 
 #define FLASH_NODE DT_ALIAS(spi_mem)
 
+/* The last 64 KB of the 4 MB NOR (0x3F0000–0x3FFFFF) is the production
+ * checkpoint ring (juxta_checkpoint.c) — carved from the tail of JXB in
+ * fw 5.8.4.  Keep JXB_SIZE in sync with RING_START/RING_SIZE there. */
 #define JXS_START 0x000000U
 #define JXS_SIZE 0x010000U
 #define JXV_START 0x010000U
 #define JXV_SIZE 0x100000U
 #define JXB_START 0x110000U
-#define JXB_SIZE 0x2F0000U
+#define JXB_SIZE 0x2E0000U
 
 #define EOF_MARKER "#EOF\n"
 
